@@ -57,9 +57,11 @@ Add the server to your client's MCP configuration. Most clients use a JSON block
 }
 ```
 
-Restart / reconnect the client so it picks up the new server. You should then see the three `antigravity_*` tools.
+Restart / reconnect the client so it picks up the new server. You should then see the six `antigravity_*` tools.
 
 ## Tools
+
+Valid `model` values (run `agy models` to see what your install offers): **`gemini-3.1-pro`** and **`gemini-3.5-flash`**.
 
 ### `antigravity_execute`
 Delegate a development task (writing code, implementing a feature, fixing a bug).
@@ -67,11 +69,12 @@ Delegate a development task (writing code, implementing a feature, fixing a bug)
 | Field | Required | Description |
 |---|---|---|
 | `task` | yes | Detailed description of what to do. |
-| `model` | yes | `gemini-3.5-pro` (complex reasoning/refactors), `gemini-3.5-flash` (quick tasks), or `gemini-3.0-pro`. |
+| `model` | yes | `gemini-3.1-pro` (complex reasoning/refactors) or `gemini-3.5-flash` (quick tasks). |
 | `success_criteria` | yes | Explicit conditions `agy` must verify before finishing, e.g. `"npx tsc --noEmit passes"`. |
 | `context_files` | no | Array of absolute file paths to point `agy` at the relevant code. |
+| `cwd` | no | Absolute working directory to run `agy` in (the repo/project to operate on). Defaults to the server's current directory. |
 
-Returns `{ job_id, status: "running" }`. When done, `antigravity_result` returns a JSON receipt:
+Returns `{ job_id, status: "running" }`. When done, `antigravity_result` / `antigravity_wait` returns a JSON receipt:
 `{ status, summary, files_changed, verification_details, failure_reason }`.
 
 ### `antigravity_research`
@@ -80,29 +83,46 @@ Delegate a codebase research or debugging investigation.
 | Field | Required | Description |
 |---|---|---|
 | `question` | yes | The research question or bug description. |
-| `model` | yes | `gemini-3.5-flash` (usually sufficient) or `gemini-3.5-pro`. |
+| `model` | yes | `gemini-3.5-flash` (usually sufficient) or `gemini-3.1-pro`. |
+| `cwd` | no | Absolute working directory to run `agy` in. Defaults to the server's current directory. |
 
-Returns `{ job_id, status: "running" }`. When done, `antigravity_result` returns a concise summary with file paths / line numbers.
+Returns `{ job_id, status: "running" }`. When done, returns a concise summary with file paths / line numbers.
 
 ### `antigravity_result`
-Poll a background job by `job_id`. Returns `{ status: "running" | "done" | "error", … }`. While `running`, wait a bit and poll again — `agy` tasks take minutes. Output is streamed to `<os tmpdir>/agy-jobs/<job_id>.out`.
+Poll a background job by `job_id` (non-blocking). Returns `{ status: "running" | "done" | "error" | "cancelled", … }`. While `running`, wait a bit and poll again — `agy` tasks take minutes. Output is streamed to `<os tmpdir>/agy-jobs/<job_id>.out`.
+
+### `antigravity_wait`
+Bounded long-poll. Blocks until the job finishes **or** `timeout_seconds` elapses (default 25, **capped at 50s** to stay under the MCP request timeout), then returns the same shape as `antigravity_result`. Prefer this over sleep+poll loops; if it returns `running`, call it again.
+
+| Field | Required | Description |
+|---|---|---|
+| `job_id` | yes | The job to wait on. |
+| `timeout_seconds` | no | Max seconds to block (default 25, capped at 50). |
+
+### `antigravity_cancel`
+Terminate a running job by `job_id` (SIGTERM to the `agy` process). Returns the resulting status; no-op if the job already finished.
+
+### `antigravity_list`
+List all jobs the server knows about (in-memory; cleared on restart), each with `status`, `kind`, `model`, `cwd`, `exit_code`, and `created`. Useful to recover a `job_id` or see what's in flight.
 
 ## Tips for good results
 
 - Give `execute` a **strict, machine-checkable `success_criteria`** (a command that exits 0). The agent is told to verify it before returning.
-- Use `pro` for architecture/refactors, `flash` for small edits and most research.
-- Provide `context_files` so the agent starts in the right place instead of searching.
+- Use `gemini-3.1-pro` for architecture/refactors, `gemini-3.5-flash` for small edits and most research.
+- Provide `context_files` so the agent starts in the right place, and `cwd` to point it at the right repo.
+- Use `antigravity_wait` instead of your own sleep+poll loop.
 
 ## Using it from an agent (e.g. Claude Code)
 
-The three tools work best when the orchestrating agent knows *when* and *how* to delegate. Drop a block like this into your project's `AGENTS.md` (or the agent's system prompt / rules file) so the client uses the connector correctly instead of guessing:
+The tools work best when the orchestrating agent knows *when* and *how* to delegate. Drop a block like this into your project's `AGENTS.md` (or the agent's system prompt / rules file) so the client uses the connector correctly instead of guessing:
 
 ````md
 ## Delegating to Antigravity (agy-connector)
 
 You have an `agy-connector` MCP server exposing `antigravity_execute`,
-`antigravity_research`, and `antigravity_result`. Use it to offload heavy work to
-the Antigravity (`agy`) CLI and keep your own context small.
+`antigravity_research`, `antigravity_result`, `antigravity_wait`,
+`antigravity_cancel`, and `antigravity_list`. Use it to offload heavy work to the
+Antigravity (`agy`) CLI and keep your own context small.
 
 ### When to delegate
 - `antigravity_execute` — large or sweeping code changes, multi-file refactors,
@@ -112,16 +132,20 @@ the Antigravity (`agy`) CLI and keep your own context small.
   files, when you only need the conclusion, not the raw file contents.
 - Do small, surgical edits yourself — delegation overhead isn't worth it for those.
 
-### How to delegate (async — always poll)
-1. Call `antigravity_execute` / `antigravity_research`. It returns a `job_id`
-   immediately and does NOT block; `agy` runs in the background.
-2. Poll `antigravity_result(job_id)`. While `status` is `"running"`, wait ~20–60s
-   and poll again — `agy` tasks usually take 1–5 minutes. Don't spin-poll, and
-   don't give up early.
-3. When `status` is `"done"` or `"error"`, read the result and act on it.
+### How to delegate (async — never block)
+1. Call `antigravity_execute` / `antigravity_research` with the `cwd` of the repo
+   to operate on. It returns a `job_id` immediately and does NOT block; `agy` runs
+   in the background.
+2. Wait for it with `antigravity_wait(job_id, timeout_seconds: 30)` — it blocks up
+   to ~30s and returns as soon as the job finishes. If it comes back `running`,
+   call it again. (Or poll `antigravity_result(job_id)` yourself between other
+   work.) `agy` tasks usually take 1–5 minutes — don't give up early.
+3. When `status` is `"done"`/`"error"`, read the result and act on it.
+4. Use `antigravity_cancel(job_id)` to stop a job that's gone wrong, and
+   `antigravity_list` to recover a `job_id` or see what's in flight.
 
 ### Write good requests
-- `model`: `gemini-3.5-pro` for complex reasoning/refactors; `gemini-3.5-flash`
+- `model`: `gemini-3.1-pro` for complex reasoning/refactors; `gemini-3.5-flash`
   for simple edits and most research.
 - `success_criteria` (execute): make it a command that exits 0
   (e.g. "`npx tsc --noEmit` passes", "`pytest -q` passes"). `agy` is instructed to
@@ -142,9 +166,9 @@ the Antigravity (`agy`) CLI and keep your own context small.
 
 ## Limitations
 
-- **Jobs are in-memory.** If the server process restarts, in-flight `job_id`s are forgotten (the `.out` files remain on disk).
+- **Jobs are in-memory.** If the server process restarts, known `job_id`s are forgotten (the `.out` files remain on disk). `antigravity_list` only sees jobs from the current process lifetime.
 - **Output files are not auto-cleaned.** `<os tmpdir>/agy-jobs/` grows over time; clear it periodically if needed.
-- **No built-in per-job timeout.** A stuck `agy` run stays `running` until it exits.
+- **No *automatic* per-job timeout.** A stuck `agy` run stays `running` until it exits or you `antigravity_cancel` it.
 - Tested on macOS with `agy` 1.0.13 and `@modelcontextprotocol/sdk` 1.29.x. Other platforms/versions are expected to work but are not yet broadly verified.
 
 ## License
