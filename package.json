@@ -1,0 +1,33 @@
+{
+  "name": "agy-connector-cc",
+  "version": "0.1.0",
+  "description": "An MCP server that lets any MCP client delegate coding and research tasks to the Antigravity (agy) CLI as a background autonomous agent.",
+  "type": "module",
+  "main": "server.mjs",
+  "bin": {
+    "agy-connector-cc": "server.mjs"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "antigravity",
+    "agy",
+    "agent",
+    "orchestrator"
+  ],
+  "license": "MIT",
+  "author": "agamairi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agamairi/agy-connector-cc.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  }
+}
