@@ -93,6 +93,53 @@ Poll a background job by `job_id`. Returns `{ status: "running" | "done" | "erro
 - Use `pro` for architecture/refactors, `flash` for small edits and most research.
 - Provide `context_files` so the agent starts in the right place instead of searching.
 
+## Using it from an agent (e.g. Claude Code)
+
+The three tools work best when the orchestrating agent knows *when* and *how* to delegate. Drop a block like this into your project's `AGENTS.md` (or the agent's system prompt / rules file) so the client uses the connector correctly instead of guessing:
+
+````md
+## Delegating to Antigravity (agy-connector)
+
+You have an `agy-connector` MCP server exposing `antigravity_execute`,
+`antigravity_research`, and `antigravity_result`. Use it to offload heavy work to
+the Antigravity (`agy`) CLI and keep your own context small.
+
+### When to delegate
+- `antigravity_execute` — large or sweeping code changes, multi-file refactors,
+  implementing a feature, or fixing a bug, where you can state a concrete,
+  machine-checkable success condition.
+- `antigravity_research` — deep codebase questions or root-causing across many
+  files, when you only need the conclusion, not the raw file contents.
+- Do small, surgical edits yourself — delegation overhead isn't worth it for those.
+
+### How to delegate (async — always poll)
+1. Call `antigravity_execute` / `antigravity_research`. It returns a `job_id`
+   immediately and does NOT block; `agy` runs in the background.
+2. Poll `antigravity_result(job_id)`. While `status` is `"running"`, wait ~20–60s
+   and poll again — `agy` tasks usually take 1–5 minutes. Don't spin-poll, and
+   don't give up early.
+3. When `status` is `"done"` or `"error"`, read the result and act on it.
+
+### Write good requests
+- `model`: `gemini-3.5-pro` for complex reasoning/refactors; `gemini-3.5-flash`
+  for simple edits and most research.
+- `success_criteria` (execute): make it a command that exits 0
+  (e.g. "`npx tsc --noEmit` passes", "`pytest -q` passes"). `agy` is instructed to
+  verify it before returning a SUCCESS receipt.
+- `context_files`: pass absolute paths to the relevant files so `agy` starts in
+  the right place instead of searching.
+
+### Verify — don't trust blindly
+- For `execute`, confirm the receipt's `status` is `SUCCESS`, and re-run the
+  `success_criteria` yourself when it matters.
+- If the receipt is `FAILURE` or `NEEDS_CLARIFICATION`, delegate again with a
+  tighter task description or more `context_files` — don't silently accept it.
+````
+
+> Tip: keep the delegated task **self-contained**. `agy` starts fresh with no
+> memory of your conversation, so spell out file paths, the goal, and the
+> acceptance check in the `task` itself.
+
 ## Limitations
 
 - **Jobs are in-memory.** If the server process restarts, in-flight `job_id`s are forgotten (the `.out` files remain on disk).
