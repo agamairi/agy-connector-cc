@@ -26,8 +26,20 @@ mkdirSync(JOBS_DIR, { recursive: true });
 
 const jobs = new Map(); // job_id -> { kind, model, cwd, status, code, outPath, child, created }
 
-// Valid `agy --model` slugs (see `agy models`).
-const MODELS = ["gemini-3.1-pro", "gemini-3.5-flash"];
+// Exact model labels accepted by `agy --model` — must match `agy models` output
+// verbatim (the CLI takes the display label as-is, not a slug; verified via the
+// `model_config_manager.go:157` resolver log, which echoes back whatever string
+// is passed as the propagated override label).
+const MODELS = [
+  "Gemini 3.5 Flash (Low)",
+  "Gemini 3.5 Flash (Medium)",
+  "Gemini 3.5 Flash (High)",
+  "Gemini 3.1 Pro (Low)",
+  "Gemini 3.1 Pro (High)",
+  "Claude Sonnet 4.6 (Thinking)",
+  "Claude Opus 4.6 (Thinking)",
+  "GPT-OSS 120B (Medium)"
+];
 // Bounded-wait cap. MUST stay under the client's MCP request timeout (often ~60s)
 // or antigravity_wait would reintroduce the "Connection closed" timeout it avoids.
 const WAIT_MAX_SECONDS = 50;
@@ -36,7 +48,7 @@ const WAIT_DEFAULT_SECONDS = 25;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const server = new Server(
-  { name: "agy-connector", version: "0.2.0" },
+  { name: "agy-connector", version: "0.2.1" },
   { capabilities: { tools: {} } }
 );
 
@@ -53,7 +65,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           model: {
             type: "string",
             enum: MODELS,
-            description: "Use 'gemini-3.1-pro' for complex reasoning/refactoring, 'gemini-3.5-flash' for simple quick tasks."
+            description: "Exact model label from `agy models`. Use a Flash tier (Low/Medium/High) for simple or fast edits, Gemini 3.1 Pro or Claude Sonnet 4.6 (Thinking) for moderate reasoning/refactoring, and Claude Opus 4.6 (Thinking) for complex, correctness-critical work (architecture, security, tricky logic). GPT-OSS 120B (Medium) is a general-purpose alternative."
           },
           success_criteria: { type: "string", description: "Explicit conditions agy must verify before finishing (e.g. 'npx tsc --noEmit passes')." },
           context_files: { type: "array", items: { type: "string" }, description: "Absolute file paths to point agy at the relevant code." },
@@ -70,7 +82,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: "object",
         properties: {
           question: { type: "string", description: "The research question or bug description." },
-          model: { type: "string", enum: MODELS, description: "'gemini-3.5-flash' is usually sufficient for research; 'gemini-3.1-pro' for hard problems." },
+          model: { type: "string", enum: MODELS, description: "Exact model label from `agy models`. A Flash tier is usually sufficient for research; reach for a Pro/Thinking tier on deep or ambiguous investigations." },
           cwd: { type: "string", description: "Absolute working directory to run agy in. Defaults to the server's current directory." }
         },
         required: ["question", "model"]

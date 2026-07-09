@@ -61,7 +61,18 @@ Restart / reconnect the client so it picks up the new server. You should then se
 
 ## Tools
 
-Valid `model` values (run `agy models` to see what your install offers): **`gemini-3.1-pro`** and **`gemini-3.5-flash`**.
+Valid `model` values are the exact labels printed by `agy models` — the CLI takes the display label as-is, not a slug:
+
+- `Gemini 3.5 Flash (Low)`
+- `Gemini 3.5 Flash (Medium)`
+- `Gemini 3.5 Flash (High)`
+- `Gemini 3.1 Pro (Low)`
+- `Gemini 3.1 Pro (High)`
+- `Claude Sonnet 4.6 (Thinking)`
+- `Claude Opus 4.6 (Thinking)`
+- `GPT-OSS 120B (Medium)`
+
+Run `agy models` on your own install to confirm — this list depends on your Antigravity subscription/tier.
 
 ### `antigravity_execute`
 Delegate a development task (writing code, implementing a feature, fixing a bug).
@@ -69,7 +80,7 @@ Delegate a development task (writing code, implementing a feature, fixing a bug)
 | Field | Required | Description |
 |---|---|---|
 | `task` | yes | Detailed description of what to do. |
-| `model` | yes | `gemini-3.1-pro` (complex reasoning/refactors) or `gemini-3.5-flash` (quick tasks). |
+| `model` | yes | Exact label from `agy models`. A Flash tier for quick tasks; Gemini 3.1 Pro / Claude Sonnet 4.6 (Thinking) for moderate reasoning; Claude Opus 4.6 (Thinking) for complex, correctness-critical work. |
 | `success_criteria` | yes | Explicit conditions `agy` must verify before finishing, e.g. `"npx tsc --noEmit passes"`. |
 | `context_files` | no | Array of absolute file paths to point `agy` at the relevant code. |
 | `cwd` | no | Absolute working directory to run `agy` in (the repo/project to operate on). Defaults to the server's current directory. |
@@ -83,7 +94,7 @@ Delegate a codebase research or debugging investigation.
 | Field | Required | Description |
 |---|---|---|
 | `question` | yes | The research question or bug description. |
-| `model` | yes | `gemini-3.5-flash` (usually sufficient) or `gemini-3.1-pro`. |
+| `model` | yes | Exact label from `agy models`. A Flash tier is usually sufficient; a Pro/Thinking tier for deep or ambiguous investigations. |
 | `cwd` | no | Absolute working directory to run `agy` in. Defaults to the server's current directory. |
 
 Returns `{ job_id, status: "running" }`. When done, returns a concise summary with file paths / line numbers.
@@ -108,7 +119,7 @@ List all jobs the server knows about (in-memory; cleared on restart), each with 
 ## Tips for good results
 
 - Give `execute` a **strict, machine-checkable `success_criteria`** (a command that exits 0). The agent is told to verify it before returning.
-- Use `gemini-3.1-pro` for architecture/refactors, `gemini-3.5-flash` for small edits and most research.
+- Use `Gemini 3.1 Pro` or `Claude Sonnet 4.6 (Thinking)` for architecture/refactors, a Flash tier for small edits and most research, and `Claude Opus 4.6 (Thinking)` for complex, correctness-critical work.
 - Provide `context_files` so the agent starts in the right place, and `cwd` to point it at the right repo.
 - Use `antigravity_wait` instead of your own sleep+poll loop.
 
@@ -145,8 +156,9 @@ Antigravity (`agy`) CLI and keep your own context small.
    `antigravity_list` to recover a `job_id` or see what's in flight.
 
 ### Write good requests
-- `model`: `gemini-3.1-pro` for complex reasoning/refactors; `gemini-3.5-flash`
-  for simple edits and most research.
+- `model`: exact label from `agy models`. Gemini 3.1 Pro / Claude Sonnet 4.6
+  (Thinking) for complex reasoning/refactors, Claude Opus 4.6 (Thinking) for
+  correctness-critical work, a Flash tier for simple edits and most research.
 - `success_criteria` (execute): make it a command that exits 0
   (e.g. "`npx tsc --noEmit` passes", "`pytest -q` passes"). `agy` is instructed to
   verify it before returning a SUCCESS receipt.
