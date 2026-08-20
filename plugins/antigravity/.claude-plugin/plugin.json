@@ -1,0 +1,6 @@
+{
+  "name": "antigravity",
+  "version": "1.0.0",
+  "description": "Use the local agy CLI from Claude Code for review and delegation.",
+  "author": { "name": "agamairi" }
+}

@@ -1,0 +1,1 @@
+Review the prior Claude response for material correctness, safety, or regression risks. You are read-only. Return JSON matching the supplied review schema. If there are no material findings, use an empty findings array.
