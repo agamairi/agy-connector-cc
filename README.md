@@ -1,188 +1,119 @@
-# agy-connector-cc
+# Antigravity for Claude Code
 
-An [MCP](https://modelcontextprotocol.io) (Model Context Protocol) server that lets any MCP client delegate **coding** and **research** tasks to the [Antigravity](https://antigravity.google) (`agy`) CLI, which runs as a **background autonomous agent**.
+Use the local Antigravity `agy` CLI from Claude Code for code review, adversarial review, delegated rescue tasks, and context replay.
 
-It implements an **orchestrator / executor** pattern: your primary agent (the MCP client) stays in control and offloads heavy, long-running work — sweeping refactors, multi-file edits, deep codebase research — to `agy`. Instead of streaming thousands of lines of terminal output back, `agy` returns a compact, structured JSON receipt, which keeps the orchestrator's context small.
+## What You Get
 
-## Why a job model?
+- `/antigravity:review` for read-only reviews of the working tree or a branch.
+- `/antigravity:adversarial-review` for steerable design and risk reviews.
+- `/antigravity:rescue` for a dedicated task handoff, optionally write-capable.
+- `/antigravity:status`, `/antigravity:result`, and `/antigravity:cancel` for tracked jobs.
+- `/antigravity:transfer` to create a new agy conversation seeded with the current Claude transcript.
 
-`agy` runs are agentic and routinely take **minutes**. Running one synchronously inside a single MCP tool call exceeds the client's request timeout and drops the stdio connection (`-32000 Connection closed`).
+## Requirements
 
-This server avoids that: `antigravity_execute` and `antigravity_research` **spawn `agy` in the background and return a `job_id` immediately**. The client then polls `antigravity_result(job_id)` until the job is no longer `running`. Every MCP call returns fast, so long delegations never time out.
-
-```
-client → antigravity_execute(task, model, success_criteria)  →  { job_id, status: "running" }
-client → antigravity_result(job_id)   →  { status: "running", partial_output_tail }   (poll…)
-client → antigravity_result(job_id)   →  { status: "done", result: { …JSON receipt… } }
-```
-
-## ⚠️ Security
-
-This server runs `agy` with **`--dangerously-skip-permissions`** — i.e. it launches a **fully autonomous coding agent with no per-action approval prompts**. Once connected, your MCP client can make `agy` read, write, and execute on your machine **without confirmation**.
-
-- Only enable this connector in environments you trust, on repositories you're willing to let an autonomous agent modify.
-- Treat the connected MCP client as having the same power over your machine that you've granted `agy`.
-- Consider running it inside a container/VM or a disposable working copy if you're experimenting.
-
-This is the connector's intended behavior (unattended delegation), but you should turn it on deliberately.
-
-## Prerequisites
-
-- **Node.js ≥ 18**
-- The **Antigravity `agy` CLI**, installed and on your `PATH`, and **authenticated** (run `agy` once interactively to log in). Verify with:
-  ```bash
-  agy --version
-  ```
+Node.js 18.18+ and the local `agy` executable must be available on `PATH`. Run `/antigravity:setup` to check the executable, version, and whether `agy models` can reach the authenticated service. This plugin does not install a package or provide an invented login command; `agy install` is the Antigravity CLI flow for configuring its path.
 
 ## Install
 
-```bash
-git clone https://github.com/agamairi/agy-connector-cc.git
-cd agy-connector-cc
-npm install
+```text
+/plugin marketplace add agamairi/agy-connector-cc
+/plugin install antigravity@agamairi-antigravity
+/reload-plugins
+/antigravity:setup
 ```
 
-## Configure your MCP client
+## Usage
 
-Add the server to your client's MCP configuration. Most clients use a JSON block like this (use the **absolute path** to `server.mjs`):
+### `/antigravity:review`
 
-```json
-{
-  "mcpServers": {
-    "agy-connector": {
-      "command": "node",
-      "args": ["/absolute/path/to/agy-connector-cc/server.mjs"]
-    }
-  }
-}
+```text
+/antigravity:review --wait
+/antigravity:review --base main --background
 ```
 
-Restart / reconnect the client so it picks up the new server. You should then see the six `antigravity_*` tools.
+Reviews are read-only. They run agy with `--mode plan`, `--sandbox`, an explicit read-only instruction, and an inline git diff. The CLI receives `--dangerously-skip-permissions` because agy denies every tool call in non-interactive print mode without it — so the write barrier comes from `--mode plan --sandbox`, not from the permission prompt.
 
-## Tools
+This was verified against agy 1.1.15: a read-only run told outright to create a file produced an implementation plan and asked for approval instead, and no file was written. Because that barrier is the only thing separating a review from a write, re-check it after upgrading agy.
 
-Valid `model` values are the exact labels printed by `agy models` — the CLI takes the display label as-is, not a slug:
+### `/antigravity:adversarial-review`
 
-- `Gemini 3.5 Flash (Low)`
-- `Gemini 3.5 Flash (Medium)`
-- `Gemini 3.5 Flash (High)`
-- `Gemini 3.1 Pro (Low)`
-- `Gemini 3.1 Pro (High)`
-- `Claude Sonnet 4.6 (Thinking)`
-- `Claude Opus 4.6 (Thinking)`
-- `GPT-OSS 120B (Medium)`
+```text
+/antigravity:adversarial-review --base main challenge the retry and rollback design
+```
 
-Run `agy models` on your own install to confirm — this list depends on your Antigravity subscription/tier.
+This follows the same review targeting but asks agy to challenge assumptions and failure modes.
 
-### `antigravity_execute`
-Delegate a development task (writing code, implementing a feature, fixing a bug).
+### `/antigravity:rescue`
 
-| Field | Required | Description |
-|---|---|---|
-| `task` | yes | Detailed description of what to do. |
-| `model` | yes | Exact label from `agy models`. A Flash tier for quick tasks; Gemini 3.1 Pro / Claude Sonnet 4.6 (Thinking) for moderate reasoning; Claude Opus 4.6 (Thinking) for complex, correctness-critical work. |
-| `success_criteria` | yes | Explicit conditions `agy` must verify before finishing, e.g. `"npx tsc --noEmit passes"`. |
-| `context_files` | no | Array of absolute file paths to point `agy` at the relevant code. |
-| `cwd` | no | Absolute working directory to run `agy` in (the repo/project to operate on). Defaults to the server's current directory. |
+```text
+/antigravity:rescue --write fix the failing integration test
+/antigravity:rescue --resume apply the top fix from the last task
+/antigravity:rescue --model fast --effort medium investigate the regression
+```
 
-Returns `{ job_id, status: "running" }`. When done, `antigravity_result` / `antigravity_wait` returns a JSON receipt:
-`{ status, summary, files_changed, verification_details, failure_reason }`.
+`fast` and the legacy `spark` alias select `gemini-3.7-flash-low`. Otherwise the plugin leaves the model unset so the local agy configuration chooses it. `--resume` uses the most recent tracked conversation for this workspace and passes `--conversation <id>`, avoiding global `agy --continue` cross-repository mistakes. Background jobs receive `--print-timeout 60m` by default; set `AGY_PRINT_TIMEOUT` to tune it.
 
-### `antigravity_research`
-Delegate a codebase research or debugging investigation.
+### `/antigravity:transfer`
 
-| Field | Required | Description |
-|---|---|---|
-| `question` | yes | The research question or bug description. |
-| `model` | yes | Exact label from `agy models`. A Flash tier is usually sufficient; a Pro/Thinking tier for deep or ambiguous investigations. |
-| `cwd` | no | Absolute working directory to run `agy` in. Defaults to the server's current directory. |
+```text
+/antigravity:transfer
+/antigravity:transfer --source ~/.claude/projects/.../session.jsonl
+```
 
-Returns `{ job_id, status: "running" }`. When done, returns a concise summary with file paths / line numbers.
+This is a **context replay**, not a native session import: agy has no importer. The command seeds a new conversation with rendered Claude history and prints `agy --conversation <id>`.
 
-### `antigravity_result`
-Poll a background job by `job_id` (non-blocking). Returns `{ status: "running" | "done" | "error" | "cancelled", … }`. While `running`, wait a bit and poll again — `agy` tasks take minutes. Output is streamed to `<os tmpdir>/agy-jobs/<job_id>.out`.
+### Job commands
 
-### `antigravity_wait`
-Bounded long-poll. Blocks until the job finishes **or** `timeout_seconds` elapses (default 25, **capped at 50s** to stay under the MCP request timeout), then returns the same shape as `antigravity_result`. Prefer this over sleep+poll loops; if it returns `running`, call it again.
+```text
+/antigravity:status
+/antigravity:status task-abc123 --wait --timeout-ms 240000
+/antigravity:result task-abc123
+/antigravity:cancel task-abc123
+```
 
-| Field | Required | Description |
-|---|---|---|
-| `job_id` | yes | The job to wait on. |
-| `timeout_seconds` | no | Max seconds to block (default 25, capped at 50). |
+Jobs are stored per workspace beneath `$CLAUDE_PLUGIN_DATA/state/antigravity`, with a temporary-directory fallback. Results and status surface the agy conversation ID and continuation command.
 
-### `antigravity_cancel`
-Terminate a running job by `job_id` (SIGTERM to the `agy` process). Returns the resulting status; no-op if the job already finished.
+## Antigravity Integration
 
-### `antigravity_list`
-List all jobs the server knows about (in-memory; cleared on restart), each with `status`, `kind`, `model`, `cwd`, `exit_code`, and `created`. Useful to recover a `job_id` or see what's in flight.
+The plugin starts `agy --print --output-format stream-json` directly and parses its NDJSON events. It uses the existing local agy authentication, models, configuration, and workspace. There is no app server layer, unlike the Codex reference architecture.
 
-## Tips for good results
+`/antigravity:setup` queries `agy models` instead of maintaining a stale model list. A compact fallback model list is used only if that command is unavailable.
 
-- Give `execute` a **strict, machine-checkable `success_criteria`** (a command that exits 0). The agent is told to verify it before returning.
-- Use `Gemini 3.1 Pro` or `Claude Sonnet 4.6 (Thinking)` for architecture/refactors, a Flash tier for small edits and most research, and `Claude Opus 4.6 (Thinking)` for complex, correctness-critical work.
-- Provide `context_files` so the agent starts in the right place, and `cwd` to point it at the right repo.
-- Use `antigravity_wait` instead of your own sleep+poll loop.
+## Typical Flows
 
-## Using it from an agent (e.g. Claude Code)
+```text
+/antigravity:review --background
+/antigravity:status
+/antigravity:result
+```
 
-The tools work best when the orchestrating agent knows *when* and *how* to delegate. Drop a block like this into your project's `AGENTS.md` (or the agent's system prompt / rules file) so the client uses the connector correctly instead of guessing:
+```text
+/antigravity:rescue --background --write investigate and fix the CI regression
+/antigravity:status
+```
 
-````md
-## Delegating to Antigravity (agy-connector)
+## Review Gate
 
-You have an `agy-connector` MCP server exposing `antigravity_execute`,
-`antigravity_research`, `antigravity_result`, `antigravity_wait`,
-`antigravity_cancel`, and `antigravity_list`. Use it to offload heavy work to the
-Antigravity (`agy`) CLI and keep your own context small.
+The Stop review gate is opt-in:
 
-### When to delegate
-- `antigravity_execute` — large or sweeping code changes, multi-file refactors,
-  implementing a feature, or fixing a bug, where you can state a concrete,
-  machine-checkable success condition.
-- `antigravity_research` — deep codebase questions or root-causing across many
-  files, when you only need the conclusion, not the raw file contents.
-- Do small, surgical edits yourself — delegation overhead isn't worth it for those.
+```text
+/antigravity:setup --enable-review-gate
+/antigravity:setup --disable-review-gate
+```
 
-### How to delegate (async — never block)
-1. Call `antigravity_execute` / `antigravity_research` with the `cwd` of the repo
-   to operate on. It returns a `job_id` immediately and does NOT block; `agy` runs
-   in the background.
-2. Wait for it with `antigravity_wait(job_id, timeout_seconds: 30)` — it blocks up
-   to ~30s and returns as soon as the job finishes. If it comes back `running`,
-   call it again. (Or poll `antigravity_result(job_id)` yourself between other
-   work.) `agy` tasks usually take 1–5 minutes — don't give up early.
-3. When `status` is `"done"`/`"error"`, read the result and act on it.
-4. Use `antigravity_cancel(job_id)` to stop a job that's gone wrong, and
-   `antigravity_list` to recover a `job_id` or see what's in flight.
+> Warning: the review gate can create long-running Claude/agy loops and drain usage limits quickly. Enable it only while actively monitoring the session.
 
-### Write good requests
-- `model`: exact label from `agy models`. Gemini 3.1 Pro / Claude Sonnet 4.6
-  (Thinking) for complex reasoning/refactors, Claude Opus 4.6 (Thinking) for
-  correctness-critical work, a Flash tier for simple edits and most research.
-- `success_criteria` (execute): make it a command that exits 0
-  (e.g. "`npx tsc --noEmit` passes", "`pytest -q` passes"). `agy` is instructed to
-  verify it before returning a SUCCESS receipt.
-- `context_files`: pass absolute paths to the relevant files so `agy` starts in
-  the right place instead of searching.
+## FAQ
 
-### Verify — don't trust blindly
-- For `execute`, confirm the receipt's `status` is `SUCCESS`, and re-run the
-  `success_criteria` yourself when it matters.
-- If the receipt is `FAILURE` or `NEEDS_CLARIFICATION`, delegate again with a
-  tighter task description or more `context_files` — don't silently accept it.
-````
+### Does this use a separate runtime or account?
 
-> Tip: keep the delegated task **self-contained**. `agy` starts fresh with no
-> memory of your conversation, so spell out file paths, the goal, and the
-> acceptance check in the `task` itself.
+No. It wraps the `agy` installed on this machine and uses its existing configuration and authentication.
 
-## Limitations
+### Why does a read-only review auto-approve permissions?
 
-- **Jobs are in-memory.** If the server process restarts, known `job_id`s are forgotten (the `.out` files remain on disk). `antigravity_list` only sees jobs from the current process lifetime.
-- **Output files are not auto-cleaned.** `<os tmpdir>/agy-jobs/` grows over time; clear it periodically if needed.
-- **No *automatic* per-job timeout.** A stuck `agy` run stays `running` until it exits or you `antigravity_cancel` it.
-- Tested on macOS with `agy` 1.0.13 and `@modelcontextprotocol/sdk` 1.29.x. Other platforms/versions are expected to work but are not yet broadly verified.
+agy denies non-interactive tool calls by default. The plugin needs permission auto-approval for review tool calls, so it layers plan mode, sandboxing, a read-only instruction, and inline diff context. Confirm the behavior of your local agy version for high-assurance use.
 
-## License
+### Can I reopen a run in agy?
 
-[MIT](LICENSE) © agamairi
+Yes. `/antigravity:status` and `/antigravity:result` print `agy --conversation <id>` when agy returned a conversation ID.
