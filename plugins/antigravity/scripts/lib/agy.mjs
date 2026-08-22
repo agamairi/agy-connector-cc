@@ -9,13 +9,123 @@ import { binaryAvailable, runCommand } from "./process.mjs";
 // prompt travels as a single argv entry. Fail with an explanation instead of a bare E2BIG.
 export const MAX_PROMPT_BYTES = 512 * 1024;
 
-export const DEFAULT_PRINT_TIMEOUT = process.env.AGY_PRINT_TIMEOUT || "60m";
+export const DEFAULT_PRINT_TIMEOUT = process.env.AGY_PRINT_TIMEOUT || "20m";
+export const DEFAULT_INACTIVITY_TIMEOUT = process.env.AGY_INACTIVITY_TIMEOUT || "15m";
 export const FAST_MODEL = "gemini-3.7-flash-low";
-const FALLBACK_MODELS = [
-  [FAST_MODEL, "Gemini 3.7 Flash (Low)"],
-  ["gemini-3.5-flash-low", "Gemini 3.5 Flash (Low)"],
-  ["gemini-3.1-pro-low", "Gemini 3.1 Pro (Low)"],
-];
+export const DEFAULT_READ_MODEL = FAST_MODEL;
+export const DEFAULT_WRITE_MODEL = "gemini-3.1-pro-low";
+export const MODEL_FAMILY_GROUPS = Object.freeze([
+  Object.freeze({
+    id: "gemini",
+    label: "Gemini",
+    prefixes: Object.freeze(["gemini"]),
+    retryModel: "gemini-3.1-pro-high",
+    models: Object.freeze([
+      Object.freeze({ slug: "gemini-3.7-flash-high", label: "Gemini 3.7 Flash (High)" }),
+      Object.freeze({ slug: "gemini-3.7-flash-medium", label: "Gemini 3.7 Flash (Medium)" }),
+      Object.freeze({ slug: FAST_MODEL, label: "Gemini 3.7 Flash (Low)" }),
+      Object.freeze({ slug: "gemini-3.6-flash-high", label: "Gemini 3.6 Flash (High)" }),
+      Object.freeze({ slug: "gemini-3.6-flash-medium", label: "Gemini 3.6 Flash (Medium)" }),
+      Object.freeze({ slug: "gemini-3.6-flash-low", label: "Gemini 3.6 Flash (Low)" }),
+      Object.freeze({ slug: "gemini-3.5-flash-high", label: "Gemini 3.5 Flash (High)" }),
+      Object.freeze({ slug: "gemini-3.5-flash-medium", label: "Gemini 3.5 Flash (Medium)" }),
+      Object.freeze({ slug: "gemini-3.5-flash-low", label: "Gemini 3.5 Flash (Low)" }),
+      Object.freeze({ slug: "gemini-3.1-pro-high", label: "Gemini 3.1 Pro (High)" }),
+      Object.freeze({ slug: DEFAULT_WRITE_MODEL, label: "Gemini 3.1 Pro (Low)" }),
+    ]),
+  }),
+  Object.freeze({
+    id: "claude-gpt",
+    label: "Claude/GPT",
+    prefixes: Object.freeze(["claude", "gpt"]),
+    retryModel: "claude-sonnet-4-6",
+    models: Object.freeze([
+      Object.freeze({ slug: "claude-sonnet-4-6", label: "Claude Sonnet 4.6 (Thinking)" }),
+      Object.freeze({ slug: "claude-opus-4-6-thinking", label: "Claude Opus 4.6 (Thinking)" }),
+      Object.freeze({ slug: "gpt-oss-120b-medium", label: "GPT-OSS 120B (Medium)" }),
+    ]),
+  }),
+]);
+const FALLBACK_MODELS = MODEL_FAMILY_GROUPS.flatMap((family) => family.models);
+
+export function classifyModelFamily(value) {
+  let normalized;
+  try {
+    normalized = String(value ?? "")
+      .trim()
+      .toLowerCase();
+  } catch {
+    return "unknown";
+  }
+  if (!normalized) return "unknown";
+  return (
+    MODEL_FAMILY_GROUPS.find((family) =>
+      family.prefixes.some(
+        (prefix) =>
+          normalized === prefix || normalized.startsWith(`${prefix}-`) || normalized.startsWith(`${prefix} `),
+      ),
+    )?.id ?? "unknown"
+  );
+}
+
+export function groupModelsByFamily(models = []) {
+  const groups = Object.fromEntries(MODEL_FAMILY_GROUPS.map((family) => [family.id, []]));
+  groups.unknown = [];
+  for (const model of Array.isArray(models) ? models : []) {
+    const family = classifyModelFamily(model?.slug ?? model?.label);
+    groups[family].push(model);
+  }
+  return groups;
+}
+
+export function isQuotaExhaustionError(value) {
+  let message;
+  try {
+    message = String(value ?? "");
+  } catch {
+    return false;
+  }
+  return (
+    /\bquota\b/i.test(message) &&
+    /\b(?:reach(?:ed)?|exhaust(?:ed|ion)?|exceed(?:ed)?|deplet(?:ed|ion)|limit)\b/i.test(message)
+  );
+}
+
+export function formatQuotaError(value, model) {
+  const original = String(value ?? "").trim();
+  if (!isQuotaExhaustionError(original)) return original;
+  const familyId = classifyModelFamily(model);
+  const family = MODEL_FAMILY_GROUPS.find((item) => item.id === familyId);
+  if (!family) {
+    const modelDetail = String(model ?? "").trim();
+    return (
+      `${original}\n\nAntigravity reported quota exhaustion, but the model family could not be determined` +
+      `${modelDetail ? ` for ${modelDetail}` : " because no model was recorded"}. ` +
+      "In observed agy 1.1.18 behavior, Gemini and Claude/GPT use separate quota pools, so one may " +
+      "still work when the other does not. Retry with an explicit model such as " +
+      "`--model gemini-3.1-pro-high` or `--model claude-sonnet-4-6`."
+    );
+  }
+  const alternative = MODEL_FAMILY_GROUPS.find((item) => item.id !== family.id);
+  return (
+    `${original}\n\nThe ${family.label} quota pool used by ${String(model).trim()} appears exhausted. ` +
+    `In observed agy 1.1.18 behavior, the ${alternative.label} family uses a separate quota pool and ` +
+    `may still work. Retry with \`--model ${alternative.retryModel}\`.`
+  );
+}
+
+export function readAgyConfiguredDefault(options = {}) {
+  const home = options.home ?? options.env?.HOME ?? os.homedir();
+  const settingsPath = path.join(home, ".gemini", "antigravity-cli", "settings.json");
+  try {
+    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    if (typeof settings?.model !== "string" || !settings.model.trim()) return null;
+    const model = settings.model.trim();
+    return { model, family: classifyModelFamily(model), settingsPath };
+  } catch {
+    return null;
+  }
+}
 export function parseModelsOutput(stdout) {
   return String(stdout)
     .split(/\r?\n/)
@@ -32,7 +142,7 @@ export function listModels(cwd, options = {}) {
   const models =
     result.status === 0 && !result.error
       ? parseModelsOutput(result.stdout)
-      : FALLBACK_MODELS.map(([slug, label]) => ({ slug, label }));
+      : FALLBACK_MODELS.map(({ slug, label }) => ({ slug, label }));
   return {
     models,
     live: result.status === 0 && !result.error,
@@ -47,7 +157,43 @@ export function normalizeModel(value, models = []) {
   const exact = models.find((model) => model.slug === raw || model.label.toLowerCase() === raw.toLowerCase());
   return exact?.slug ?? raw;
 }
+export function resolveJobModel(cwd, options = {}) {
+  const explicit = String(options.explicit ?? "").trim();
+  if (explicit) {
+    const available = (options.modelLister ?? listModels)(cwd).models;
+    return normalizeModel(explicit, available);
+  }
+  // AGY_DEFAULT_MODEL is itself a default, not a request to discover models. Keep this path local:
+  // `agy models` is an authenticated network call and must not run on every task invocation.
+  const configured = String((options.env ?? process.env).AGY_DEFAULT_MODEL ?? "").trim();
+  if (configured) return normalizeModel(configured);
+  return options.write ? DEFAULT_WRITE_MODEL : DEFAULT_READ_MODEL;
+}
 export const getAgyAvailability = (cwd) => binaryAvailable("agy", ["--version"], { cwd });
+
+export function extractVerificationText(value) {
+  const text = String(value ?? "").trim();
+  const heading = /(?:^|\n)[ \t]*(?:#{1,6}[ \t]+)?Verification[ \t]*:?[ \t]*(.*)(?:\n|$)/i.exec(text);
+  if (!heading) return null;
+  const start = heading.index + heading[0].length;
+  const inline = heading[1]?.trim();
+  const trailing = text.slice(start).trim();
+  const body = [inline, trailing].filter(Boolean).join("\n").trim();
+  return body || null;
+}
+
+export function parseDurationMs(value, fallback = null) {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  const match = String(value ?? "")
+    .trim()
+    .match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h)$/i);
+  if (!match) {
+    if (fallback !== null) return parseDurationMs(fallback);
+    throw new Error(`Invalid duration "${value}". Use a value such as 500ms, 30s, 15m, or 2h.`);
+  }
+  const multiplier = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000 }[match[2].toLowerCase()];
+  return Number(match[1]) * multiplier;
+}
 
 export function shorten(value, limit = 96) {
   const normalized = String(value ?? "")
@@ -253,7 +399,7 @@ export function cleanAgyStderr(stderr) {
 // Reviews therefore get their write barrier from `--mode plan --sandbox`, plus an explicit
 // read-only prompt and an inline git diff as defence in depth.
 //
-// Verified against agy 1.1.15: a read-only run instructed outright to create a file emitted an
+// Verified against agy 1.1.18: a read-only run instructed outright to create a file emitted an
 // implementation plan and asked for approval instead, and no file appeared on disk. Re-check
 // this if you bump the agy version — it is the only thing standing between a review and a write.
 export async function runAgy(cwd, options = {}) {
@@ -267,13 +413,17 @@ export async function runAgy(cwd, options = {}) {
   // immediately after it. Appending the prompt at the end instead makes agy treat the
   // following flag ("--output-format") as the prompt and silently drop both the real
   // prompt and the JSON output format.
+  const printTimeout = options.timeout ?? options.env?.AGY_PRINT_TIMEOUT ?? DEFAULT_PRINT_TIMEOUT;
+  const inactivityTimeout =
+    options.inactivityTimeout ?? options.env?.AGY_INACTIVITY_TIMEOUT ?? DEFAULT_INACTIVITY_TIMEOUT;
+  const inactivityTimeoutMs = parseDurationMs(inactivityTimeout);
   const args = [
     "--print",
     options.prompt ?? "",
     "--output-format",
     "stream-json",
     "--print-timeout",
-    options.timeout ?? DEFAULT_PRINT_TIMEOUT,
+    printTimeout,
     "--dangerously-skip-permissions",
   ];
   if (options.readOnly) args.push("--mode", "plan", "--sandbox");
@@ -304,9 +454,29 @@ export async function runAgy(cwd, options = {}) {
       stderr = "",
       remainder = "",
       conversationId = null,
-      final = null;
+      model = options.model ?? null,
+      final = null,
+      inactivityTimer = null,
+      forceKillTimer = null,
+      inactivityError = null;
     const events = [];
     const report = (event) => options.onProgress?.(event);
+    const clearInactivityTimer = () => {
+      if (inactivityTimer) clearTimeout(inactivityTimer);
+      inactivityTimer = null;
+    };
+    const resetInactivityTimer = () => {
+      clearInactivityTimer();
+      if (inactivityTimeoutMs === 0) return;
+      inactivityTimer = setTimeout(() => {
+        inactivityError = `Antigravity produced no output for ${inactivityTimeout}; the run was terminated as stalled.`;
+        report({ message: inactivityError, phase: "stalled" });
+        child.kill("SIGTERM");
+        forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+        forceKillTimer.unref?.();
+      }, inactivityTimeoutMs);
+      inactivityTimer.unref?.();
+    };
     const consume = (line) => {
       if (!line.trim()) return;
       let event;
@@ -319,7 +489,13 @@ export async function runAgy(cwd, options = {}) {
       events.push(event);
       if (event.event === "init") {
         conversationId = event.conversation_id ?? conversationId;
-        report({ message: `Conversation ${conversationId ?? "started"}`, phase: "starting", conversationId });
+        model = event.init?.model ?? model;
+        report({
+          message: `Conversation ${conversationId ?? "started"}`,
+          phase: "starting",
+          conversationId,
+          model,
+        });
       } else if (event.event === "step_update") {
         const update = event.step_update ?? {};
         conversationId = update.conversation_id ?? conversationId;
@@ -339,8 +515,10 @@ export async function runAgy(cwd, options = {}) {
       } else if (event.event === "result") {
         final = event.result ?? {};
         conversationId = final.conversation_id ?? conversationId;
+        model = final.model ?? model;
+        const finalError = formatQuotaError(final.error, model);
         report({
-          message: final.status === "SUCCESS" ? "Completed." : (final.error ?? "Failed."),
+          message: final.status === "SUCCESS" ? "Completed." : finalError || "Failed.",
           phase: final.status === "SUCCESS" ? "finalizing" : "failed",
           conversationId,
         });
@@ -351,6 +529,8 @@ export async function runAgy(cwd, options = {}) {
     const outDecoder = new StringDecoder("utf8");
     const errDecoder = new StringDecoder("utf8");
     child.stdout.on("data", (chunk) => {
+      resetInactivityTimer();
+      options.onProgress?.({});
       const text = outDecoder.write(chunk);
       if (!text) return;
       stdout += text;
@@ -362,10 +542,18 @@ export async function runAgy(cwd, options = {}) {
       }
     });
     child.stderr.on("data", (chunk) => {
+      resetInactivityTimer();
+      options.onProgress?.({});
       stderr += errDecoder.write(chunk);
     });
-    child.on("error", reject);
+    child.on("error", (error) => {
+      clearInactivityTimer();
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      reject(error);
+    });
     child.on("close", (code, signal) => {
+      clearInactivityTimer();
+      if (forceKillTimer) clearTimeout(forceKillTimer);
       // Flush any bytes the decoders are still holding before parsing the tail.
       const tail = outDecoder.end();
       if (tail) {
@@ -386,23 +574,29 @@ export async function runAgy(cwd, options = {}) {
           .join("");
       const status = final?.status ?? (code === 0 ? "SUCCESS" : "ERROR"),
         cleanedStderr = cleanAgyStderr(stderr),
-        error = String(final?.error ?? "").trim() || (status === "SUCCESS" ? "" : cleanedStderr);
+        rawError =
+          inactivityError || String(final?.error ?? "").trim() || (status === "SUCCESS" ? "" : cleanedStderr),
+        error = inactivityError || formatQuotaError(rawError, model),
+        result = final && error !== rawError ? { ...final, error } : final;
       resolve({
-        status,
-        exitStatus: final?.status === "SUCCESS" && code === 0 ? 0 : code || 1,
+        status: inactivityError ? "STALLED" : status,
+        exitStatus: inactivityError ? 1 : final?.status === "SUCCESS" && code === 0 ? 0 : code || 1,
         code,
         signal,
         stdout,
         stderr: cleanedStderr,
         events,
-        result: final,
+        result,
         conversationId,
+        model,
         response,
         error,
         touchedFiles: collectTouchedFiles(events, cwd),
         usage: final?.usage && typeof final.usage === "object" ? final.usage : null,
+        stalled: Boolean(inactivityError),
       });
     });
+    resetInactivityTimer();
     child.stdin.end();
   });
 }

@@ -1,7 +1,6 @@
 ---
 description: Check whether the local agy CLI is ready and toggle the stop-time review gate
 argument-hint: '[--enable-review-gate|--disable-review-gate]'
-disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
 

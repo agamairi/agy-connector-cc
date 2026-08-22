@@ -81,10 +81,11 @@ test("sorts jobs newest first and resolves the latest result when no id is given
 test("requires a job id when multiple jobs are active", () =>
   withPluginData(() => {
     const cwd = makeTempDir();
+    const now = new Date().toISOString();
     saveState(cwd, {
       jobs: [
-        { id: "old-running", status: "running", updatedAt: "2026-01-01T00:00:00.000Z" },
-        { id: "new-queued", status: "queued", updatedAt: "2026-01-02T00:00:00.000Z" },
+        { id: "old-running", status: "running", updatedAt: now, pid: process.pid },
+        { id: "new-queued", status: "queued", updatedAt: now, pid: process.pid },
       ],
     });
 

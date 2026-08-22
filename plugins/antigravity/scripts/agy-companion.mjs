@@ -5,7 +5,16 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
-import { getAgyAvailability, listModels, normalizeModel, parseStructuredOutput, runAgy } from "./lib/agy.mjs";
+import {
+  extractVerificationText,
+  getAgyAvailability,
+  groupModelsByFamily,
+  listModels,
+  parseStructuredOutput,
+  readAgyConfiguredDefault,
+  resolveJobModel,
+  runAgy,
+} from "./lib/agy.mjs";
 import { renderTranscriptAsPrompt, resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
@@ -17,8 +26,8 @@ import {
   resolveResultJob,
   sortJobsNewestFirst,
 } from "./lib/job-control.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
-import { interpolateTemplate, loadPromptTemplate } from "./lib/prompts.mjs";
+import { binaryAvailable, getProcessIdentity, terminateProcessTree } from "./lib/process.mjs";
+import { buildTaskPrompt, interpolateTemplate, loadPromptTemplate } from "./lib/prompts.mjs";
 import { generateJobId, getConfig, listJobs, setConfig, upsertJob, writeJobFile } from "./lib/state.mjs";
 import {
   appendLogLine,
@@ -53,11 +62,9 @@ const parseInput = (argv, config) =>
     aliasMap: { C: "cwd", m: "model", ...(config.aliasMap ?? {}) },
   });
 const cwdFor = (options) => (options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd());
-// `listModels` shells out to `agy models`, which is a network round-trip. Only pay for it
-// when the user actually named a model; otherwise we leave the model unset and let the CLI
-// config decide, exactly as the reference plugin does.
-const resolveModel = (cwd, value) =>
-  String(value ?? "").trim() ? normalizeModel(value, listModels(cwd).models) : null;
+// `resolveJobModel` only shells out to `agy models` for an explicit --model. Built-in and
+// AGY_DEFAULT_MODEL defaults stay local so the normal invocation path has no extra network call.
+const resolveModel = (cwd, value, options = {}) => resolveJobModel(cwd, { ...options, explicit: value });
 const textLine = (text, fallback) =>
   String(text ?? "")
     .split(/\r?\n/)
@@ -72,7 +79,7 @@ function usage() {
       "  node scripts/agy-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/agy-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/agy-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/agy-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|fast>] [--effort <low|medium|high>] [prompt]",
+      "  node scripts/agy-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|fast>] [--effort <low|medium|high>] [--success-criteria <text>] [prompt]",
       "  node scripts/agy-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/agy-companion.mjs status [job-id] [--wait] [--timeout-ms <ms>] [--all] [--json]",
       "  node scripts/agy-companion.mjs result [job-id] [--json]",
@@ -119,7 +126,7 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
     timeoutMs,
   };
 }
-function createJob({ prefix, kind, title, root, jobClass, summary, write = false }) {
+function createJob({ prefix, kind, title, root, jobClass, summary, write = false, model = null }) {
   return createJobRecord({
     id: generateJobId(prefix),
     kind,
@@ -129,6 +136,7 @@ function createJob({ prefix, kind, title, root, jobClass, summary, write = false
     jobClass,
     summary,
     write,
+    model,
   });
 }
 function tracked(job, stderr = false, logFile = null) {
@@ -161,7 +169,9 @@ async function setup(argv) {
     actionsTaken.push(`Disabled the stop-time review gate for ${root}.`);
   }
   const agy = getAgyAvailability(cwd),
-    models = agy.available ? listModels(cwd) : { live: false, detail: "agy unavailable", models: [] },
+    listedModels = agy.available ? listModels(cwd) : { live: false, detail: "agy unavailable", models: [] },
+    models = { ...listedModels, groups: groupModelsByFamily(listedModels.models) },
+    agyConfiguredDefault = readAgyConfiguredDefault(),
     config = getConfig(root);
   const nextSteps = [];
   if (!agy.available)
@@ -179,6 +189,7 @@ async function setup(argv) {
     node: binaryAvailable("node"),
     agy,
     models,
+    agyConfiguredDefault,
     reviewGateEnabled: Boolean(config.stopReviewGate),
     actionsTaken,
     nextSteps,
@@ -223,6 +234,7 @@ async function executeReview(request) {
     review: reviewLabel,
     target,
     context: { repoRoot: context.repoRoot, branch: context.branch, summary: context.summary },
+    model: agy.model,
     agy,
     result: parsed.parsed,
     rawOutput: parsed.rawOutput,
@@ -230,11 +242,19 @@ async function executeReview(request) {
   };
   return {
     exitStatus: agy.exitStatus,
+    stalled: agy.stalled,
+    error: agy.error,
     conversationId: agy.conversationId,
     touchedFiles: agy.touchedFiles,
     usage: agy.usage,
+    model: agy.model,
     payload,
-    rendered: renderReviewResult(parsed, { reviewLabel, targetLabel: target.label }),
+    rendered: renderReviewResult(parsed, {
+      reviewLabel,
+      targetLabel: target.label,
+      model: agy.model,
+      failureMessage: agy.error,
+    }),
     summary: parsed.parsed?.summary ?? textLine(agy.response, `${reviewLabel} finished.`),
   };
 }
@@ -257,7 +277,7 @@ async function review(argv, adversarial) {
     throw new Error(
       `\`/antigravity:review\` does not accept focus text. Retry with \`/antigravity:adversarial-review ${focus}\` for focused review instructions.`,
     );
-  const model = resolveModel(cwd, options.model);
+  const model = resolveModel(cwd, options.model, { write: false });
   const label = adversarial ? "Adversarial Review" : "Review";
   const job = createJob({
     prefix: "review",
@@ -266,21 +286,44 @@ async function review(argv, adversarial) {
     root,
     jobClass: "review",
     summary: `${label} ${target.label}`,
+    model,
   });
-  await foreground(
-    job,
-    (progress) =>
-      executeReview({
-        cwd,
-        base: options.base,
-        scope: options.scope,
-        model,
-        focus,
-        adversarial,
-        onProgress: progress,
-      }),
-    options.json,
-  );
+  const request = {
+    type: "review",
+    cwd,
+    base: options.base,
+    scope: options.scope,
+    model,
+    focus,
+    adversarial,
+  };
+  if (options.background) {
+    ensureAgyAvailable(cwd);
+    ensureGitRepository(cwd);
+    const { logFile } = tracked(job);
+    appendLogLine(logFile, "Queued for background execution.");
+    const child = spawnWorker(cwd, job.id);
+    const pidStartedAt = nowIso();
+    const stored = {
+      ...job,
+      status: "queued",
+      phase: "queued",
+      pid: child.pid ?? null,
+      pidStartedAt,
+      pidIdentity: child.pid ? getProcessIdentity(child.pid) : null,
+      lastEventAt: job.createdAt,
+      logFile,
+      request,
+    };
+    writeJobFile(root, job.id, stored);
+    upsertJob(root, stored);
+    return output(
+      { jobId: job.id, status: "queued", title: job.title, summary: job.summary, model, logFile },
+      `${job.title} started in the background as ${job.id}. Check /antigravity:status ${job.id} for progress.\n`,
+      options.json,
+    );
+  }
+  await foreground(job, (progress) => executeReview({ ...request, onProgress: progress }), options.json);
 }
 function taskPrompt(cwd, options, positionals) {
   return options["prompt-file"]
@@ -314,7 +357,10 @@ async function executeTask(request) {
   if (!request.prompt && !conversationId)
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume/--resume-last.");
   const agy = await runAgy(root, {
-    prompt: request.prompt || "Continue the prior task.",
+    prompt: buildTaskPrompt(request.prompt || "Continue the prior task.", {
+      write: request.write,
+      successCriteria: request.successCriteria,
+    }),
     conversationId,
     model: request.model,
     effort: request.effort,
@@ -322,14 +368,31 @@ async function executeTask(request) {
     readOnly: !request.write,
     onProgress: request.onProgress,
   });
-  const payload = { status: agy.status, conversationId: agy.conversationId, rawOutput: agy.response, agy };
+  const verification = request.write ? extractVerificationText(agy.response) : null;
+  const payload = {
+    status: agy.status,
+    conversationId: agy.conversationId,
+    model: agy.model,
+    verification,
+    rawOutput: agy.response,
+    agy,
+  };
   return {
     exitStatus: agy.exitStatus,
+    stalled: agy.stalled,
+    error: agy.error,
     conversationId: agy.conversationId,
     touchedFiles: agy.touchedFiles,
     usage: agy.usage,
+    model: agy.model,
+    verification,
     payload,
-    rendered: renderTaskResult({ rawOutput: agy.response, failureMessage: agy.error }),
+    rendered: renderTaskResult({
+      rawOutput: agy.response,
+      failureMessage: agy.error,
+      model: agy.model,
+      verification,
+    }),
     summary: textLine(
       agy.response,
       request.resume ? "Antigravity resume finished." : "Antigravity task finished.",
@@ -339,7 +402,7 @@ async function executeTask(request) {
 function spawnWorker(cwd, jobId) {
   const child = spawn(
     process.execPath,
-    [path.join(ROOT_DIR, "scripts", "agy-companion.mjs"), "task-worker", "--cwd", cwd, "--job-id", jobId],
+    [path.join(ROOT_DIR, "scripts", "agy-companion.mjs"), "job-worker", "--cwd", cwd, "--job-id", jobId],
     { cwd, env: process.env, detached: true, stdio: "ignore", windowsHide: true },
   );
   child.unref();
@@ -347,7 +410,7 @@ function spawnWorker(cwd, jobId) {
 }
 async function task(argv) {
   const { options, positionals } = parseInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "success-criteria"],
     booleanOptions: ["json", "write", "resume", "resume-last", "fresh", "background"],
   });
   if ((options.resume || options["resume-last"]) && options.fresh)
@@ -356,7 +419,8 @@ async function task(argv) {
     root = resolveWorkspaceRoot(cwd),
     prompt = taskPrompt(cwd, options, positionals),
     resume = Boolean(options.resume || options["resume-last"]),
-    model = resolveModel(cwd, options.model),
+    write = Boolean(options.write),
+    model = resolveModel(cwd, options.model, { write }),
     effort = normalizeEffort(options.effort),
     title = resume ? "Antigravity Resume" : "Antigravity Task",
     job = createJob({
@@ -366,9 +430,19 @@ async function task(argv) {
       root,
       jobClass: "task",
       summary: textLine(prompt, resume ? "Continue prior task" : "Task"),
-      write: Boolean(options.write),
+      write,
+      model,
     }),
-    request = { cwd, prompt, resume, model, effort, write: Boolean(options.write), jobId: job.id };
+    request = {
+      cwd,
+      prompt,
+      resume,
+      model,
+      effort,
+      successCriteria: options["success-criteria"] ?? null,
+      write,
+      jobId: job.id,
+    };
   if (options.background) {
     ensureAgyAvailable(cwd);
     if (!prompt && !resume)
@@ -376,11 +450,22 @@ async function task(argv) {
     const { logFile } = tracked(job);
     appendLogLine(logFile, "Queued for background execution.");
     const child = spawnWorker(cwd, job.id);
-    const stored = { ...job, status: "queued", phase: "queued", pid: child.pid ?? null, logFile, request };
+    const pidStartedAt = nowIso();
+    const stored = {
+      ...job,
+      status: "queued",
+      phase: "queued",
+      pid: child.pid ?? null,
+      pidStartedAt,
+      pidIdentity: child.pid ? getProcessIdentity(child.pid) : null,
+      lastEventAt: job.createdAt,
+      logFile,
+      request: { ...request, type: "task" },
+    };
     writeJobFile(root, job.id, stored);
     upsertJob(root, stored);
     return output(
-      { jobId: job.id, status: "queued", title, summary: job.summary, logFile },
+      { jobId: job.id, status: "queued", title, summary: job.summary, model, logFile },
       `${title} started in the background as ${job.id}. Check /antigravity:status ${job.id} for progress.\n`,
       options.json,
     );
@@ -391,22 +476,28 @@ async function worker(argv) {
   const { options } = parseInput(argv, { valueOptions: ["cwd", "job-id"] });
   if (!options["job-id"]) throw new Error("Missing --job-id.");
   const cwd = cwdFor(options),
-    root = resolveWorkspaceRoot(cwd),
+    root = resolveWorkspaceRoot(cwd);
+  let stored = null;
+  for (let attempt = 0; attempt < 20 && !stored; attempt += 1) {
     stored = readStoredJob(root, options["job-id"]);
+    if (!stored) await sleep(25);
+  }
   if (!stored?.request) throw new Error(`No stored task request found for ${options["job-id"]}.`);
   const { logFile, progress } = tracked(stored, false, stored.logFile);
-  await runTrackedJob(
-    { ...stored, workspaceRoot: root, logFile },
-    () => executeTask({ ...stored.request, onProgress: progress }),
-    { logFile },
-  );
+  const runner =
+    stored.request.type === "review"
+      ? () => executeReview({ ...stored.request, onProgress: progress })
+      : () => executeTask({ ...stored.request, onProgress: progress });
+  await runTrackedJob({ ...stored, workspaceRoot: root, logFile }, runner, { logFile });
 }
 async function transfer(argv) {
   const { options } = parseInput(argv, { valueOptions: ["cwd", "source"], booleanOptions: ["json"] });
   const cwd = cwdFor(options),
     sourcePath = resolveClaudeSessionPath(cwd, options),
+    model = resolveModel(cwd, null, { write: false }),
     agy = await runAgy(resolveWorkspaceRoot(cwd), {
       prompt: renderTranscriptAsPrompt(sourcePath),
+      model,
       write: false,
       readOnly: true,
     });
@@ -417,12 +508,13 @@ async function transfer(argv) {
   }
   const payload = {
     conversationId: agy.conversationId,
+    model: agy.model,
     sourcePath,
     resumeCommand: agy.conversationId ? `agy --conversation ${agy.conversationId}` : null,
   };
   output(
     payload,
-    `Created a new Antigravity conversation by replaying the Claude transcript as context (not a native session import).\nAntigravity conversation ID: ${payload.conversationId ?? "unavailable"}\nContinue in agy: ${payload.resumeCommand ?? "unavailable"}\n`,
+    `Created a new Antigravity conversation by replaying the Claude transcript as context (not a native session import).\nModel used: ${payload.model}\nAntigravity conversation ID: ${payload.conversationId ?? "unavailable"}\nContinue in agy: ${payload.resumeCommand ?? "unavailable"}\n`,
     options.json,
   );
 }
@@ -524,6 +616,7 @@ async function main() {
     case "task":
       return task(argv);
     case "task-worker":
+    case "job-worker":
       return worker(argv);
     case "transfer":
       return transfer(argv);

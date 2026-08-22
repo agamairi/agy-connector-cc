@@ -4,15 +4,24 @@ import path from "node:path";
 import process from "node:process";
 import test from "node:test";
 import {
+  classifyModelFamily,
   cleanAgyStderr,
   collectTouchedFiles,
+  DEFAULT_INACTIVITY_TIMEOUT,
+  DEFAULT_PRINT_TIMEOUT,
+  DEFAULT_READ_MODEL,
+  DEFAULT_WRITE_MODEL,
   describeCompletedItem,
   describeStartedItem,
+  formatQuotaError,
+  isQuotaExhaustionError,
   looksLikeVerificationCommand,
+  MODEL_FAMILY_GROUPS,
   normalizeModel,
   parseModelsOutput,
   MAX_PROMPT_BYTES,
   parseStructuredOutput,
+  resolveJobModel,
   runAgy,
 } from "../plugins/antigravity/scripts/lib/agy.mjs";
 import { fixturePath, makeTempDir } from "./helpers.mjs";
@@ -46,6 +55,90 @@ test("parses models and normalizes fast aliases", () => {
   assert.equal(normalizeModel("fast", models), "gemini-3.7-flash-low");
   assert.equal(normalizeModel("Gemini 3.7 Flash (Low)", models), "gemini-3.7-flash-low");
 });
+test("classifies known, display-label, future, and unknown models without throwing", () => {
+  const cases = [
+    ["gemini-3.1-pro-high", "gemini"],
+    ["Gemini 3.7 Flash (Low)", "gemini"],
+    ["gemini-4-ultra", "gemini"],
+    ["claude-sonnet-4-6", "claude-gpt"],
+    ["Claude Opus 4.6 (Thinking)", "claude-gpt"],
+    ["gpt-oss-120b-medium", "claude-gpt"],
+    ["GPT Future Reasoner", "claude-gpt"],
+    ["some-new-provider-model", "unknown"],
+    [null, "unknown"],
+  ];
+  for (const [model, family] of cases) assert.equal(classifyModelFamily(model), family, String(model));
+  assert.equal(
+    classifyModelFamily({
+      toString() {
+        throw new Error("nope");
+      },
+    }),
+    "unknown",
+  );
+  assert.deepEqual(
+    MODEL_FAMILY_GROUPS.map((family) => family.id),
+    ["gemini", "claude-gpt"],
+  );
+});
+
+test("detects quota exhaustion and preserves the original error in an actionable family message", async () => {
+  const original =
+    "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 29h49m43s.";
+  assert.equal(isQuotaExhaustionError(original), true);
+  assert.equal(isQuotaExhaustionError("Request failed for an unrelated reason"), false);
+  const formatted = formatQuotaError(original, "claude-sonnet-4-6");
+  assert.ok(formatted.startsWith(original));
+  assert.match(formatted, /Claude\/GPT quota pool/);
+  assert.match(formatted, /Gemini family uses a separate quota pool/);
+  assert.match(formatted, /--model gemini-3\.1-pro-high/);
+  assert.match(formatted, /Resets in 29h49m43s/);
+
+  const result = await runAgy(makeTempDir(), {
+    command: process.execPath,
+    commandArgs: [fixturePath],
+    prompt: "quota fixture",
+    model: "claude-sonnet-4-6",
+    env: { ...process.env, FAKE_AGY_SCENARIO: "quota-error" },
+  });
+  assert.equal(result.exitStatus, 1);
+  assert.equal(result.model, "claude-sonnet-4-6");
+  assert.ok(result.error.startsWith(original));
+  assert.equal(result.result.error, result.error);
+});
+
+test("quota errors do not guess when no model family can be determined", () => {
+  const message = formatQuotaError("Quota limit exceeded. Resets in 2h.", null);
+  assert.match(message, /model family could not be determined because no model was recorded/);
+  assert.match(message, /Gemini and Claude\/GPT use separate quota pools/);
+});
+test("resolves local class defaults and environment overrides without listing models", () => {
+  let calls = 0;
+  const modelLister = () => {
+    calls += 1;
+    return { models: [{ slug: "gemini-3.7-flash-medium", label: "Gemini 3.7 Flash (Medium)" }] };
+  };
+  assert.equal(resolveJobModel("/repo", { write: false, modelLister }), DEFAULT_READ_MODEL);
+  assert.equal(resolveJobModel("/repo", { write: true, modelLister }), DEFAULT_WRITE_MODEL);
+  assert.equal(
+    resolveJobModel("/repo", {
+      write: true,
+      env: { AGY_DEFAULT_MODEL: "gemini-3.7-flash-high" },
+      modelLister,
+    }),
+    "gemini-3.7-flash-high",
+  );
+  assert.equal(calls, 0, "defaults must not invoke agy models");
+  assert.equal(
+    resolveJobModel("/repo", {
+      explicit: "Gemini 3.7 Flash (Medium)",
+      env: { AGY_DEFAULT_MODEL: "gemini-3.7-flash-high" },
+      modelLister,
+    }),
+    "gemini-3.7-flash-medium",
+  );
+  assert.equal(calls, 1, "only explicit --model should list models");
+});
 test("parses the agy NDJSON runtime stream defensively", async () => {
   const result = await runAgy(makeTempDir(), {
     command: process.execPath,
@@ -73,6 +166,51 @@ test("puts the prompt immediately after --print and preserves stream-json output
   const printIndex = args.indexOf("--print");
   assert.equal(args[printIndex + 1], "the exact prompt");
   assert.deepEqual(args.slice(printIndex + 2, printIndex + 4), ["--output-format", "stream-json"]);
+  assert.deepEqual(args.slice(args.indexOf("--print-timeout"), args.indexOf("--print-timeout") + 2), [
+    "--print-timeout",
+    "20m",
+  ]);
+});
+
+test("uses separate lowered print and inactivity timeout defaults", () => {
+  assert.equal(DEFAULT_PRINT_TIMEOUT, "20m");
+  assert.equal(DEFAULT_INACTIVITY_TIMEOUT, "15m");
+});
+
+test("honors independent print and inactivity environment overrides", async () => {
+  const cwd = makeTempDir();
+  const argsFile = path.join(cwd, "agy-args.json");
+  await runAgy(cwd, {
+    command: process.execPath,
+    commandArgs: [fixturePath],
+    prompt: "overrides",
+    env: {
+      ...process.env,
+      AGY_PRINT_TIMEOUT: "37m",
+      AGY_INACTIVITY_TIMEOUT: "2m",
+      FAKE_AGY_ARGS_FILE: argsFile,
+    },
+  });
+  const args = JSON.parse(fs.readFileSync(argsFile, "utf8"));
+  assert.deepEqual(args.slice(args.indexOf("--print-timeout"), args.indexOf("--print-timeout") + 2), [
+    "--print-timeout",
+    "37m",
+  ]);
+});
+
+test("terminates a silent foreground run at the independent inactivity timeout", async () => {
+  const result = await runAgy(makeTempDir(), {
+    command: process.execPath,
+    commandArgs: [fixturePath],
+    prompt: "stay silent",
+    inactivityTimeout: "40ms",
+    timeout: "20m",
+    env: { ...process.env, FAKE_AGY_SCENARIO: "silent" },
+  });
+  assert.equal(result.status, "STALLED");
+  assert.equal(result.stalled, true);
+  assert.equal(result.exitStatus, 1);
+  assert.match(result.error, /no output for 40ms/i);
 });
 
 test("ignores unknown events, unknown step types, and malformed NDJSON lines", async () => {

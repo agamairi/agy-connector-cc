@@ -226,6 +226,252 @@ test("task --resume and --fresh route conversations and reject invalid resume re
   assertCleanError(mutuallyExclusive, /Choose either --resume\/--resume-last or --fresh/);
 });
 
+test("write tasks require verification while read-only research stays lean", () => {
+  const cwd = makeRepository();
+  const pluginData = makeTempDir();
+  const binDir = makeTempDir();
+  const argsFile = path.join(makeTempDir(), "agy-args.json");
+  installFakeAgy(binDir);
+
+  parseJsonResult(
+    runCompanion(["task", "--write", "--json", "implement", "the", "fix"], {
+      cwd,
+      pluginData,
+      binDir,
+      env: { FAKE_AGY_ARGS_FILE: argsFile },
+    }),
+  );
+  let args = JSON.parse(fs.readFileSync(argsFile, "utf8"));
+  const writePrompt = args[args.indexOf("--print") + 1];
+  assert.match(writePrompt, /<success_criteria>/);
+  assert.match(writePrompt, /Run the relevant tests, builds, type-checks/);
+  assert.match(writePrompt, /headed exactly `## Verification`/);
+  assert.match(writePrompt, /criteria you chose/);
+
+  parseJsonResult(
+    runCompanion(["task", "--json", "locate", "the", "regression"], {
+      cwd,
+      pluginData,
+      binDir,
+      env: { FAKE_AGY_ARGS_FILE: argsFile },
+    }),
+  );
+  args = JSON.parse(fs.readFileSync(argsFile, "utf8"));
+  const researchPrompt = args[args.indexOf("--print") + 1];
+  assert.match(researchPrompt, /read-only research agent/);
+  assert.match(researchPrompt, /file paths and line numbers/);
+  assert.doesNotMatch(researchPrompt, /<success_criteria>|headed exactly `## Verification`/);
+  assert.ok(researchPrompt.length < writePrompt.length, "research prompt should remain leaner");
+});
+
+test("task forwards explicit success criteria into the verification block", () => {
+  const cwd = makeRepository();
+  const pluginData = makeTempDir();
+  const binDir = makeTempDir();
+  const argsFile = path.join(makeTempDir(), "agy-args.json");
+  installFakeAgy(binDir);
+  parseJsonResult(
+    runCompanion(["task", "--write", "--json", "--success-criteria", "npm test passes", "fix it"], {
+      cwd,
+      pluginData,
+      binDir,
+      env: { FAKE_AGY_ARGS_FILE: argsFile },
+    }),
+  );
+  const args = JSON.parse(fs.readFileSync(argsFile, "utf8"));
+  const prompt = args[args.indexOf("--print") + 1];
+  assert.match(prompt, /<success_criteria>\nnpm test passes\n<\/success_criteria>/);
+  assert.match(prompt, /<task>\nfix it\n<\/task>/);
+});
+
+test("job classes use explicit conservative default models", () => {
+  const cwd = makeRepository();
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 9;\n");
+  const pluginData = makeTempDir();
+  const binDir = makeTempDir();
+  const argsFile = path.join(makeTempDir(), "agy-args.json");
+  installFakeAgy(binDir);
+  const runAndReadModel = (argv) => {
+    parseJsonResult(runCompanion(argv, { cwd, pluginData, binDir, env: { FAKE_AGY_ARGS_FILE: argsFile } }));
+    const args = JSON.parse(fs.readFileSync(argsFile, "utf8"));
+    return args[args.indexOf("--model") + 1];
+  };
+  assert.equal(runAndReadModel(["task", "--write", "--json", "edit"]), "gemini-3.1-pro-low");
+  assert.equal(runAndReadModel(["task", "--json", "research"]), "gemini-3.7-flash-low");
+  assert.equal(runAndReadModel(["review", "--json", "--scope", "working-tree"]), "gemini-3.7-flash-low");
+});
+
+test("AGY_DEFAULT_MODEL overrides class defaults", () => {
+  const cwd = makeRepository();
+  const pluginData = makeTempDir();
+  const binDir = makeTempDir();
+  const argsFile = path.join(makeTempDir(), "agy-args.json");
+  installFakeAgy(binDir);
+  const base = {
+    cwd,
+    pluginData,
+    binDir,
+    env: { AGY_DEFAULT_MODEL: "gemini-3.7-flash-high", FAKE_AGY_ARGS_FILE: argsFile },
+  };
+  parseJsonResult(runCompanion(["task", "--write", "--json", "edit"], base));
+  const args = JSON.parse(fs.readFileSync(argsFile, "utf8"));
+  assert.equal(args[args.indexOf("--model") + 1], "gemini-3.7-flash-high");
+});
+
+test("explicit --model wins over AGY_DEFAULT_MODEL", () => {
+  const cwd = makeRepository();
+  const pluginData = makeTempDir();
+  const binDir = makeTempDir();
+  const argsFile = path.join(makeTempDir(), "agy-args.json");
+  installFakeAgy(binDir);
+  parseJsonResult(
+    runCompanion(["task", "--write", "--json", "--model", "gemini-3.7-flash-medium", "edit"], {
+      cwd,
+      pluginData,
+      binDir,
+      env: { AGY_DEFAULT_MODEL: "gemini-3.7-flash-high", FAKE_AGY_ARGS_FILE: argsFile },
+    }),
+  );
+  const args = JSON.parse(fs.readFileSync(argsFile, "utf8"));
+  assert.equal(args[args.indexOf("--model") + 1], "gemini-3.7-flash-medium");
+});
+
+test("model and verification are recorded and rendered in result and single-job status", () => {
+  const cwd = makeRepository();
+  const pluginData = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeAgy(binDir);
+  const env = { [SESSION_ID_ENV]: "quality-recording" };
+  const task = parseJsonResult(
+    runCompanion(["task", "--write", "--json", "implement", "fixture"], {
+      cwd,
+      pluginData,
+      binDir,
+      env,
+    }),
+  );
+  assert.equal(task.model, "gemini-3.1-pro-low");
+  assert.equal(task.agy.model, "gemini-3.1-pro-low");
+  assert.match(task.verification, /Criteria: fixture criteria/);
+  assert.match(task.verification, /Outcome: passed/);
+
+  const result = parseJsonResult(runCompanion(["result", "--json"], { cwd, pluginData, binDir, env }));
+  for (const record of [result.job, result.storedJob]) {
+    assert.equal(record.model, "gemini-3.1-pro-low");
+    assert.match(record.verification, /Outcome: passed/);
+  }
+
+  const renderedResult = runCompanion(["result", result.job.id], { cwd, pluginData, binDir, env });
+  assert.equal(renderedResult.status, 0, renderedResult.stderr);
+  assert.match(renderedResult.stdout, /Model used: gemini-3\.1-pro-low/);
+  assert.match(renderedResult.stdout, /Verification:\nCriteria: fixture criteria/);
+
+  const renderedStatus = runCompanion(["status", result.job.id], { cwd, pluginData, binDir, env });
+  assert.equal(renderedStatus.status, 0, renderedStatus.stderr);
+  assert.match(renderedStatus.stdout, /Model used: gemini-3\.1-pro-low/);
+  assert.match(renderedStatus.stdout, /Verification:\n\s+Criteria: fixture criteria/);
+});
+
+test("quota failures are actionable in task results, stored records, and single-job status", () => {
+  const cwd = makeRepository();
+  const pluginData = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeAgy(binDir);
+  const env = { [SESSION_ID_ENV]: "quota-recording", FAKE_AGY_SCENARIO: "quota-error" };
+  const taskResult = runCompanion(["task", "--json", "--model", "claude-sonnet-4-6", "investigate quota"], {
+    cwd,
+    pluginData,
+    binDir,
+    env,
+  });
+  assert.equal(taskResult.status, 1);
+  const task = JSON.parse(taskResult.stdout);
+  assert.match(task.agy.error, /Individual quota reached/);
+  assert.match(task.agy.error, /Claude\/GPT quota pool/);
+  assert.match(task.agy.error, /--model gemini-3\.1-pro-high/);
+
+  const result = parseJsonResult(runCompanion(["result", "--json"], { cwd, pluginData, binDir, env }));
+  for (const record of [result.job, result.storedJob]) {
+    assert.match(record.errorMessage, /Individual quota reached/);
+    assert.match(record.errorMessage, /Claude\/GPT quota pool/);
+  }
+
+  const status = parseJsonResult(
+    runCompanion(["status", result.job.id, "--json"], { cwd, pluginData, binDir, env }),
+  );
+  assert.equal(status.job.errorMessage, result.job.errorMessage);
+  const renderedStatus = runCompanion(["status", result.job.id], { cwd, pluginData, binDir, env });
+  assert.match(renderedStatus.stdout, /Reason: Individual quota reached/);
+  assert.match(renderedStatus.stdout, /Gemini family uses a separate quota pool/);
+
+  const renderedResult = runCompanion(["result", result.job.id], { cwd, pluginData, binDir, env });
+  assert.match(renderedResult.stdout, /Individual quota reached/);
+  assert.match(renderedResult.stdout, /--model gemini-3\.1-pro-high/);
+});
+
+test("setup groups models by family and reports agy's configured default best-effort", () => {
+  const cwd = makeRepository();
+  const pluginData = makeTempDir();
+  const binDir = makeTempDir();
+  const testHome = makeTempDir();
+  const settingsDir = path.join(testHome, ".gemini", "antigravity-cli");
+  fs.mkdirSync(settingsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(settingsDir, "settings.json"),
+    JSON.stringify({ model: "Claude Sonnet 4.6 (Thinking)" }),
+  );
+  installFakeAgy(binDir);
+
+  const json = parseJsonResult(
+    runCompanion(["setup", "--json"], { cwd, pluginData, binDir, env: { HOME: testHome } }),
+  );
+  assert.deepEqual(
+    json.models.groups.gemini.map((model) => model.slug),
+    ["gemini-3.7-flash-high", "gemini-3.7-flash-medium", "gemini-3.7-flash-low", "gemini-3.1-pro-low"],
+  );
+  assert.deepEqual(
+    json.models.groups["claude-gpt"].map((model) => model.slug),
+    ["claude-sonnet-4-6", "gpt-oss-120b-medium"],
+  );
+  assert.deepEqual(json.agyConfiguredDefault, {
+    model: "Claude Sonnet 4.6 (Thinking)",
+    family: "claude-gpt",
+    settingsPath: path.join(settingsDir, "settings.json"),
+  });
+
+  const rendered = runCompanion(["setup"], { cwd, pluginData, binDir, env: { HOME: testHome } });
+  assert.match(rendered.stdout, /Models by quota family \(observed with agy 1\.1\.18\):/);
+  assert.match(rendered.stdout, /- Gemini pool:\n\s+- gemini-3\.7-flash-high/);
+  assert.match(rendered.stdout, /- Claude\/GPT pool:\n\s+- claude-sonnet-4-6/);
+  assert.match(
+    rendered.stdout,
+    /agy configured default: Claude Sonnet 4\.6 \(Thinking\) \(Claude\/GPT pool\)/,
+  );
+});
+
+test("setup survives missing and malformed agy settings files", () => {
+  const cwd = makeRepository();
+  const pluginData = makeTempDir();
+  const binDir = makeTempDir();
+  const testHome = makeTempDir();
+  installFakeAgy(binDir);
+
+  const missing = parseJsonResult(
+    runCompanion(["setup", "--json"], { cwd, pluginData, binDir, env: { HOME: testHome } }),
+  );
+  assert.equal(missing.ready, true);
+  assert.equal(missing.agyConfiguredDefault, null);
+
+  const settingsDir = path.join(testHome, ".gemini", "antigravity-cli");
+  fs.mkdirSync(settingsDir, { recursive: true });
+  fs.writeFileSync(path.join(settingsDir, "settings.json"), "{not json");
+  const malformed = parseJsonResult(
+    runCompanion(["setup", "--json"], { cwd, pluginData, binDir, env: { HOME: testHome } }),
+  );
+  assert.equal(malformed.ready, true);
+  assert.equal(malformed.agyConfiguredDefault, null);
+});
+
 test("setup toggles the review gate and rejects conflicting switches", () => {
   const cwd = makeRepository();
   const pluginData = makeTempDir();
@@ -517,6 +763,7 @@ test("single-job status shows the latest running progress without final-output b
   const binDir = makeTempDir();
   installFakeAgy(binDir);
   withStateEnvironment(pluginData, null, () => {
+    const startedAt = new Date().toISOString();
     const logFile = resolveJobLogFile(cwd, "running-preview");
     fs.writeFileSync(
       logFile,
@@ -536,7 +783,9 @@ test("single-job status shows the latest running progress without final-output b
       jobClass: "task",
       title: "Preview fixture",
       logFile,
-      startedAt: "2026-01-01T00:00:00.000Z",
+      startedAt,
+      lastEventAt: startedAt,
+      pid: process.pid,
     });
   });
 

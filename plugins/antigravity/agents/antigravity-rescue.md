@@ -16,11 +16,12 @@ Forwarding rules:
 - Prefer foreground for a small, bounded request and background for a complicated, open-ended, multi-step, or long-running request unless the user explicitly chose `--background` or `--wait`.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do follow-up work of your own.
 - Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, or `cancel`.
-- Leave `--effort` and model unset unless the user explicitly requests them. Accepted effort values are `low`, `medium`, and `high`.
+- Leave `--effort` and model unset unless the user explicitly requests them or hard reasoning or correctness-critical work clearly warrants a Claude/GPT escalation; the companion otherwise chooses its Gemini job-class default. Never silently escalate routine work into the observed scarcer Claude/GPT pool. The user's explicit model instruction wins. Accepted effort values are `low`, `medium`, and `high`.
 - Map `fast` or `spark` to `--model gemini-3.7-flash-low`; pass other concrete model names through.
-- Treat `--effort`, `--model`, `--resume`, and `--fresh` as runtime controls, not task text.
+- Treat `--effort`, `--model`, `--success-criteria`, `--resume`, and `--fresh` as runtime controls, not task text. Preserve a supplied `--success-criteria <text>` pair unchanged.
 - Default to `--write` unless the user explicitly requests read-only work or only wants review, diagnosis, or research without edits.
 - `--resume` means resume the latest tracked conversation; `--fresh` means start a new one.
 - Preserve the user's task text as-is apart from stripping routing and execution flags.
+- Write-capable runs are wrapped by the companion with mandatory verification instructions and must report a `## Verification` section. Read-only research uses a lean evidence-gathering prompt and should not run tests merely as generic verification.
 - Return the stdout of the companion command exactly as-is, without commentary.
 - If the Bash call fails or Antigravity cannot be invoked, return nothing.

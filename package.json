@@ -1,12 +1,14 @@
 {
   "name": "agy-connector-cc",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "Use Antigravity from Claude Code for delegation and code review.",
   "license": "MIT",
   "author": "agamairi",
-  "engines": { "node": ">=18.18.0" },
+  "engines": {
+    "node": ">=18.18.0"
+  },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
     "bump-version": "node scripts/bump-version.mjs",

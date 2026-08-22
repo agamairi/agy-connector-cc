@@ -1,3 +1,5 @@
+import { MODEL_FAMILY_GROUPS } from "./agy.mjs";
+
 function severityRank(severity) {
   return { critical: 0, high: 1, medium: 2, low: 3 }[severity] ?? 4;
 }
@@ -90,17 +92,24 @@ function formatUsage(usage) {
 }
 
 function pushExecutionDetails(lines, job) {
+  if (job.model) lines.push(`  Model used: ${job.model}`);
   const touchedFiles = Array.isArray(job.touchedFiles) ? job.touchedFiles : [];
   if (Array.isArray(job.touchedFiles) || job.write === false) {
     lines.push(`  Files changed: ${touchedFiles.length ? touchedFiles.join(", ") : "no files modified"}`);
   }
   const usage = formatUsage(job.usage);
   if (usage) lines.push(`  Tokens: ${usage}`);
+  if (typeof job.verification === "string" && job.verification.trim()) {
+    lines.push("  Verification:");
+    for (const line of job.verification.trim().split(/\r?\n/)) lines.push(`    ${line}`);
+  }
 }
 
 function appendStoredResultMetadata(rendered, job, storedJob) {
   const details = [];
-  pushExecutionDetails(details, { ...job, ...storedJob });
+  const merged = { ...job, ...storedJob };
+  if (merged.model && rendered.includes(`Model used: ${merged.model}`)) merged.model = null;
+  pushExecutionDetails(details, merged);
   if (!details.length) return rendered;
   return `${rendered.trimEnd()}\n\n${details.map((line) => line.trimStart()).join("\n")}\n`;
 }
@@ -125,7 +134,9 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.summary) lines.push(`  Summary: ${job.summary}`);
   if (job.phase) lines.push(`  Phase: ${job.phase}`);
   if (options.showElapsed && job.elapsed) lines.push(`  Elapsed: ${job.elapsed}`);
+  if (job.noOutputFor) lines.push(`  No output for: ${job.noOutputFor}`);
   if (options.showDuration && job.duration) lines.push(`  Duration: ${job.duration}`);
+  if (job.errorMessage) lines.push(`  Reason: ${job.errorMessage}`);
   if (job.conversationId) {
     lines.push(`  Antigravity conversation ID: ${job.conversationId}`);
     lines.push(`  Continue in agy: ${resumeCommand(job)}`);
@@ -167,6 +178,27 @@ export function renderSetupReport(report) {
     `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
     "",
   ];
+  if (report.agyConfiguredDefault) {
+    const family = MODEL_FAMILY_GROUPS.find((item) => item.id === report.agyConfiguredDefault.family);
+    lines.push(
+      `agy configured default: ${report.agyConfiguredDefault.model} (${family ? `${family.label} pool` : "unknown family"})`,
+      "",
+    );
+  }
+  if (report.models?.models?.length) {
+    lines.push("Models by quota family (observed with agy 1.1.18):");
+    for (const family of MODEL_FAMILY_GROUPS) {
+      lines.push(`- ${family.label} pool:`);
+      for (const model of report.models.groups?.[family.id] ?? []) {
+        lines.push(`  - ${model.slug} — ${model.label}`);
+      }
+    }
+    if (report.models.groups?.unknown?.length) {
+      lines.push("- Unknown family:");
+      for (const model of report.models.groups.unknown) lines.push(`  - ${model.slug} — ${model.label}`);
+    }
+    lines.push("");
+  }
   if (report.actionsTaken?.length) {
     lines.push("Actions taken:");
     for (const action of report.actionsTaken) lines.push(`- ${action}`);
@@ -184,10 +216,12 @@ export function renderReviewResult(parsedResult, meta) {
     const lines = [
       `# Antigravity ${meta.reviewLabel}`,
       "",
+      ...(meta.model ? [`Model used: ${meta.model}`, ""] : []),
       "Antigravity did not return valid structured JSON.",
       "",
       `- Parse error: ${parsedResult.parseError}`,
     ];
+    if (meta.failureMessage) lines.push("", meta.failureMessage);
     if (parsedResult.rawOutput) {
       lines.push("", "Raw final message:", "", "```text", parsedResult.rawOutput, "```");
     }
@@ -200,6 +234,7 @@ export function renderReviewResult(parsedResult, meta) {
       `# Antigravity ${meta.reviewLabel}`,
       "",
       `Target: ${meta.targetLabel}`,
+      ...(meta.model ? [`Model used: ${meta.model}`] : []),
       "Antigravity returned JSON with an unexpected review shape.",
       "",
       `- Validation error: ${validationError}`,
@@ -218,6 +253,7 @@ export function renderReviewResult(parsedResult, meta) {
     `# Antigravity ${meta.reviewLabel}`,
     "",
     `Target: ${meta.targetLabel}`,
+    ...(meta.model ? [`Model used: ${meta.model}`] : []),
     `Verdict: ${data.verdict}`,
     "",
     data.summary,
@@ -242,10 +278,17 @@ export function renderReviewResult(parsedResult, meta) {
 
 export function renderTaskResult(parsedResult) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
-  if (rawOutput) return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
+  if (rawOutput) {
+    const lines = [rawOutput.trimEnd()];
+    if (parsedResult.model) lines.push("", `Model used: ${parsedResult.model}`);
+    if (parsedResult.verification) {
+      lines.push("", "Verification summary:", parsedResult.verification.trim());
+    }
+    return `${lines.join("\n").trimEnd()}\n`;
+  }
   const message =
     String(parsedResult?.failureMessage ?? "").trim() || "Antigravity did not return a final message.";
-  return `${message}\n`;
+  return `${message}${parsedResult?.model ? `\n\nModel used: ${parsedResult.model}` : ""}\n`;
 }
 
 export function renderStatusReport(report) {

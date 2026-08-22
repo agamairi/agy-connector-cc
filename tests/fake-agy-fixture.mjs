@@ -9,11 +9,20 @@ if (process.env.FAKE_AGY_ARGS_FILE) {
 }
 
 if (args.includes("--version")) {
-  console.log("1.1.15");
+  console.log("1.1.18");
   process.exit(0);
 }
 if (args[0] === "models") {
-  console.log("gemini-3.7-flash-low\tGemini 3.7 Flash (Low)");
+  console.log(
+    [
+      "gemini-3.7-flash-high\tGemini 3.7 Flash (High)",
+      "gemini-3.7-flash-medium\tGemini 3.7 Flash (Medium)",
+      "gemini-3.7-flash-low\tGemini 3.7 Flash (Low)",
+      "gemini-3.1-pro-low\tGemini 3.1 Pro (Low)",
+      "claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)",
+      "gpt-oss-120b-medium\tGPT-OSS 120B (Medium)",
+    ].join("\n"),
+  );
   process.exit(0);
 }
 // Mirror the real CLI: `--print` takes the very next argv entry as the prompt.
@@ -26,6 +35,13 @@ if (prompt.startsWith("--")) {
   process.exit(2);
 }
 const id = "fake-conversation-123";
+const modelIndex = args.indexOf("--model");
+const selectedModel = modelIndex >= 0 ? args[modelIndex + 1] : "fixture-unset-model";
+
+if (scenario === "silent") {
+  await new Promise((resolve) => setTimeout(resolve, 60_000));
+  process.exit(0);
+}
 
 if (scenario === "stderr-noise" || scenario === "stderr-failure") {
   console.error("INFO Loading Antigravity runtime");
@@ -38,7 +54,11 @@ if (scenario === "multibyte") {
   // split across chunk boundaries. A reader using chunk.toString() mangles these into U+FFFD.
   const text = "café — 日本語 ✅\n";
   const payload =
-    JSON.stringify({ event: "init", conversation_id: id, init: { model: "m", cwd: process.cwd() } }) +
+    JSON.stringify({
+      event: "init",
+      conversation_id: id,
+      init: { model: selectedModel, cwd: process.cwd() },
+    }) +
     "\n" +
     JSON.stringify({
       event: "result",
@@ -68,9 +88,28 @@ console.log(
   JSON.stringify({
     event: "init",
     conversation_id: id,
-    init: { model: "gemini-3.7-flash-low", cwd: process.cwd() },
+    init: { model: selectedModel, cwd: process.cwd() },
   }),
 );
+if (scenario === "quota-error") {
+  const error =
+    "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 29h49m43s.";
+  console.log(
+    JSON.stringify({
+      event: "result",
+      result: {
+        conversation_id: id,
+        model: selectedModel,
+        status: "ERROR",
+        response: "",
+        error,
+        duration_seconds: 0.1,
+        num_turns: 0,
+      },
+    }),
+  );
+  process.exit(0);
+}
 if (scenario === "tool-events") {
   const toolEvents = [
     ["list_dir", { DirectoryPath: process.cwd() }],
@@ -148,7 +187,9 @@ console.log(
               ],
               next_steps: [],
             })
-          : "PONG\n",
+          : prompt.includes("headed exactly `## Verification`")
+            ? "Fixture task complete.\n\n## Verification\nCriteria: fixture criteria.\nOutcome: passed.\n"
+            : "PONG\n",
     },
   }),
 );
@@ -173,7 +214,9 @@ const response =
             }
           : { verdict: "pass", summary: "ok", findings: [], next_steps: [] },
       )
-    : "PONG\n";
+    : prompt.includes("headed exactly `## Verification`")
+      ? "Fixture task complete.\n\n## Verification\nCriteria: fixture criteria.\nOutcome: passed.\n"
+      : "PONG\n";
 const result = {
   event: "result",
   result: {

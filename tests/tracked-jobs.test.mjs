@@ -38,6 +38,8 @@ function execution(label) {
   return {
     exitStatus: 0,
     conversationId: `conversation-${label}`,
+    model: "gemini-3.1-pro-low",
+    verification: "npm test passed",
     payload: { rawOutput: label },
     rendered: `${label}\n`,
     summary: label,
@@ -51,6 +53,7 @@ test("normalizes object and string progress events without leaking malformed fie
     message: "hello",
     phase: null,
     conversationId: null,
+    model: null,
     stderrMessage: "hello",
     logTitle: null,
     logBody: null,
@@ -60,6 +63,7 @@ test("normalizes object and string progress events without leaking malformed fie
       message: " Reading app.js ",
       phase: " investigating ",
       conversationId: " conversation-1 ",
+      model: " gemini-3.1-pro-low ",
       stderrMessage: null,
       logTitle: " Details ",
       logBody: "body\n",
@@ -68,6 +72,7 @@ test("normalizes object and string progress events without leaking malformed fie
       message: "Reading app.js",
       phase: "investigating",
       conversationId: "conversation-1",
+      model: "gemini-3.1-pro-low",
       stderrMessage: null,
       logTitle: "Details",
       logBody: "body",
@@ -96,9 +101,32 @@ test("tracked jobs persist touched files, usage, and progress identity in both r
     for (const record of [summary, stored]) {
       assert.deepEqual(record.touchedFiles, ["src/persist.js"]);
       assert.deepEqual(record.usage, { total_tokens: 100, thinking_tokens: 10 });
+      assert.equal(record.model, "gemini-3.1-pro-low");
+      assert.equal(record.verification, "npm test passed");
       assert.equal(record.conversationId, "conversation-persist");
       assert.equal(record.status, "completed");
     }
+  });
+});
+
+test("every progress event refreshes lastEventAt even when phase and conversation are unchanged", async () => {
+  await withPluginData(async () => {
+    const workspace = makeTempDir();
+    const current = job(workspace, "task-heartbeat");
+    let index = 0;
+    const updater = createJobProgressUpdater(workspace, current.id, {
+      now: () => ["2026-08-22T00:01:00.000Z", "2026-08-22T00:02:00.000Z"][index++],
+    });
+    const runPromise = runTrackedJob(current, async () => {
+      updater({ phase: "running", conversationId: "conversation-heartbeat", message: "first" });
+      updater({ phase: "running", conversationId: "conversation-heartbeat", message: "second" });
+      const summary = listJobs(workspace).find((item) => item.id === current.id);
+      const stored = readJobFile(resolveJobFile(workspace, current.id));
+      assert.equal(summary.lastEventAt, "2026-08-22T00:02:00.000Z");
+      assert.equal(stored.lastEventAt, "2026-08-22T00:02:00.000Z");
+      return execution("heartbeat");
+    });
+    await runPromise;
   });
 });
 

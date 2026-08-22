@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import process from "node:process";
+import { getProcessIdentity } from "./process.mjs";
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 export const SESSION_ID_ENV = "ANTIGRAVITY_COMPANION_SESSION_ID";
 export const nowIso = () => new Date().toISOString();
@@ -13,6 +14,7 @@ export function normalizeProgressEvent(value) {
         typeof value.conversationId === "string" && value.conversationId.trim()
           ? value.conversationId.trim()
           : null,
+      model: typeof value.model === "string" && value.model.trim() ? value.model.trim() : null,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
       logBody: value.logBody == null ? null : String(value.logBody).trimEnd(),
@@ -23,6 +25,7 @@ export function normalizeProgressEvent(value) {
     message,
     phase: null,
     conversationId: null,
+    model: null,
     stderrMessage: message,
     logTitle: null,
     logBody: null,
@@ -45,24 +48,25 @@ export function createJobRecord(base, options = {}) {
   const id = (options.env ?? process.env)[options.sessionIdEnv ?? SESSION_ID_ENV];
   return { ...base, createdAt: nowIso(), ...(id ? { sessionId: id } : {}) };
 }
-export function createJobProgressUpdater(root, id) {
+export function createJobProgressUpdater(root, id, options = {}) {
   let lastPhase = null,
-    lastConversationId = null;
+    lastConversationId = null,
+    lastModel = null;
   return (event) => {
     const normalized = normalizeProgressEvent(event),
-      patch = { id };
-    let changed = false;
+      patch = { id, lastEventAt: (options.now ?? nowIso)() };
     if (normalized.phase && normalized.phase !== lastPhase) {
       lastPhase = normalized.phase;
       patch.phase = normalized.phase;
-      changed = true;
     }
     if (normalized.conversationId && normalized.conversationId !== lastConversationId) {
       lastConversationId = normalized.conversationId;
       patch.conversationId = normalized.conversationId;
-      changed = true;
     }
-    if (!changed) return;
+    if (normalized.model && normalized.model !== lastModel) {
+      lastModel = normalized.model;
+      patch.model = normalized.model;
+    }
     upsertJob(root, patch);
     const file = resolveJobFile(root, id);
     const stored = readStoredJobOrNull(root, id);
@@ -101,33 +105,48 @@ export function readStoredJobOrNull(workspaceRoot, jobId) {
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
+  const startedAt = nowIso();
   const running = {
     ...job,
     status: "running",
-    startedAt: nowIso(),
+    startedAt,
+    lastEventAt: startedAt,
     phase: "starting",
     pid: process.pid,
+    pidStartedAt: startedAt,
+    pidIdentity: (options.getProcessIdentity ?? getProcessIdentity)(process.pid),
     logFile: options.logFile ?? job.logFile ?? null,
   };
   writeJobFile(job.workspaceRoot, job.id, running);
   upsertJob(job.workspaceRoot, running);
   try {
     const execution = await runner();
-    const status = execution.exitStatus === 0 ? "completed" : "failed",
+    const reconciled = readStoredJobOrNull(job.workspaceRoot, job.id);
+    if (reconciled && !["queued", "running"].includes(reconciled.status) && reconciled.status !== "failed") {
+      return execution;
+    }
+    const status = execution.stalled ? "stalled" : execution.exitStatus === 0 ? "completed" : "failed",
       completedAt = nowIso(),
       touchedFiles = Array.isArray(execution.touchedFiles) ? execution.touchedFiles : [],
-      usage = execution.usage && typeof execution.usage === "object" ? execution.usage : null;
+      usage = execution.usage && typeof execution.usage === "object" ? execution.usage : null,
+      model = execution.model ?? running.model ?? null,
+      verification = execution.verification ?? null,
+      errorMessage = status === "completed" ? null : String(execution.error ?? "").trim() || null;
     const final = {
       ...running,
       status,
-      phase: status === "completed" ? "done" : "failed",
+      phase: status === "completed" ? "done" : status,
       pid: null,
       completedAt,
+      lastEventAt: completedAt,
       conversationId: execution.conversationId ?? null,
       result: execution.payload,
       rendered: execution.rendered,
       touchedFiles,
       usage,
+      model,
+      verification,
+      ...(errorMessage ? { errorMessage } : {}),
     };
     writeJobFile(job.workspaceRoot, job.id, final);
     upsertJob(job.workspaceRoot, {
@@ -136,10 +155,14 @@ export async function runTrackedJob(job, runner, options = {}) {
       phase: final.phase,
       pid: null,
       completedAt,
+      lastEventAt: completedAt,
       conversationId: final.conversationId,
       summary: execution.summary,
       touchedFiles,
       usage,
+      model,
+      verification,
+      ...(errorMessage ? { errorMessage } : {}),
     });
     appendLogBlock(running.logFile, "Final output", execution.rendered);
     return execution;
@@ -147,12 +170,14 @@ export async function runTrackedJob(job, runner, options = {}) {
     const message = error instanceof Error ? error.message : String(error),
       completedAt = nowIso();
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? running;
+    if (!["queued", "running", "failed"].includes(existing.status)) throw error;
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,
       status: "failed",
       phase: "failed",
       pid: null,
       completedAt,
+      lastEventAt: completedAt,
       errorMessage: message,
     });
     upsertJob(job.workspaceRoot, {
@@ -161,6 +186,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       phase: "failed",
       pid: null,
       completedAt,
+      lastEventAt: completedAt,
       errorMessage: message,
     });
     throw error;

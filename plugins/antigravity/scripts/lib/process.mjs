@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import process from "node:process";
 export function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {
@@ -46,6 +47,52 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
       detail: result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`,
     };
   return { available: true, detail: result.stdout.trim() || result.stderr.trim() || "ok" };
+}
+
+export function isProcessAlive(pid, options = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    (options.killImpl ?? process.kill.bind(process))(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+export function getProcessIdentity(pid, options = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const platform = options.platform ?? process.platform;
+  if (platform === "linux") {
+    try {
+      const stat = (options.readFileImpl ?? fs.readFileSync)(`/proc/${pid}/stat`, "utf8");
+      const fields = stat
+        .slice(stat.lastIndexOf(")") + 2)
+        .trim()
+        .split(/\s+/);
+      return fields[19] ? `linux-start-ticks:${fields[19]}` : null;
+    } catch {
+      return null;
+    }
+  }
+
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  if (platform === "win32") {
+    const result = runCommandImpl(
+      "powershell",
+      [
+        "-NoProfile",
+        "-Command",
+        `(Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\").CreationDate.ToUniversalTime().Ticks`,
+      ],
+      {},
+    );
+    const value = result.status === 0 && !result.error ? result.stdout.trim() : "";
+    return value ? `windows-start-ticks:${value}` : null;
+  }
+
+  const result = runCommandImpl("ps", ["-p", String(pid), "-o", "lstart="], {});
+  const value = result.status === 0 && !result.error ? result.stdout.trim().replace(/\s+/g, " ") : "";
+  return value ? `posix-start:${value}` : null;
 }
 function signalTarget(pid, signal, method, killImpl) {
   const target = method === "process-group" ? -pid : pid;

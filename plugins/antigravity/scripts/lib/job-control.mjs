@@ -1,16 +1,143 @@
 import fs from "node:fs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
-import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { parseDurationMs } from "./agy.mjs";
+import { getProcessIdentity, isProcessAlive } from "./process.mjs";
+import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "./state.mjs";
+import { appendLogLine, SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
+export const DEFAULT_INACTIVITY_TIMEOUT = "15m";
+export const DEFAULT_NO_PID_REAP_TIMEOUT = "5m";
+export const DEFAULT_UNVERIFIED_PID_MAX_AGE = "1h";
 
 export const sortJobsNewestFirst = (jobs) =>
   [...jobs].sort((a, b) =>
     String(b.updatedAt ?? b.createdAt ?? "").localeCompare(String(a.updatedAt ?? a.createdAt ?? "")),
   );
-const active = (job) => job.status === "queued" || job.status === "running";
+export const isActiveJob = (job) => job.status === "queued" || job.status === "running";
+
+function ageMs(value, now) {
+  const at = Date.parse(value ?? "");
+  return Number.isFinite(at) ? Math.max(0, now - at) : Number.POSITIVE_INFINITY;
+}
+
+function signalProcessTree(pid, options = {}) {
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (process.platform !== "win32") {
+    try {
+      killImpl(-pid, "SIGTERM");
+      return true;
+    } catch {}
+  }
+  try {
+    killImpl(pid, "SIGTERM");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function persistReconciledJob(root, job, status, reason, now) {
+  const completedAt = new Date(now).toISOString();
+  const patch = {
+    id: job.id,
+    status,
+    phase: status,
+    pid: null,
+    completedAt,
+    errorMessage: reason,
+  };
+  const stored = readStoredJob(root, job.id);
+  if (stored) writeJobFile(root, job.id, { ...stored, ...patch });
+  upsertJob(root, patch);
+  appendLogLine(job.logFile ?? stored?.logFile, reason);
+  return { ...job, ...patch, updatedAt: completedAt };
+}
+
+export function reconcileActiveJobs(cwd, options = {}) {
+  const root = resolveWorkspaceRoot(cwd);
+  const now = options.nowMs?.() ?? Date.now();
+  const env = options.env ?? process.env;
+  const inactivityTimeoutMs = parseDurationMs(
+    options.inactivityTimeout ?? env.AGY_INACTIVITY_TIMEOUT ?? DEFAULT_INACTIVITY_TIMEOUT,
+  );
+  const noPidTimeoutMs = parseDurationMs(
+    options.noPidTimeout ?? env.AGY_NO_PID_REAP_TIMEOUT ?? DEFAULT_NO_PID_REAP_TIMEOUT,
+  );
+  const unverifiedPidMaxAgeMs = parseDurationMs(
+    options.unverifiedPidMaxAge ?? env.AGY_UNVERIFIED_PID_MAX_AGE ?? DEFAULT_UNVERIFIED_PID_MAX_AGE,
+  );
+  const processAlive = options.isProcessAlive ?? isProcessAlive;
+  const processIdentity = options.getProcessIdentity ?? getProcessIdentity;
+  const terminate = options.terminateProcess ?? ((pid) => signalProcessTree(pid, options));
+
+  return listJobs(root).map((job) => {
+    if (!isActiveJob(job)) return job;
+    const activeSince = job.startedAt ?? job.createdAt ?? job.updatedAt;
+    const silentSince = job.lastEventAt ?? activeSince;
+    const activeAge = ageMs(activeSince, now);
+    const silentAge = ageMs(silentSince, now);
+    if (!Number.isInteger(job.pid) || job.pid <= 0) {
+      if (activeAge < noPidTimeoutMs) return job;
+      return persistReconciledJob(
+        root,
+        job,
+        "interrupted",
+        "Worker process never reported a PID or result.",
+        now,
+      );
+    }
+    if (!processAlive(job.pid)) {
+      return persistReconciledJob(
+        root,
+        job,
+        "interrupted",
+        "Worker process exited without reporting a result.",
+        now,
+      );
+    }
+
+    const liveIdentity = processIdentity(job.pid);
+    if (job.pidIdentity && liveIdentity && job.pidIdentity !== liveIdentity) {
+      return persistReconciledJob(
+        root,
+        job,
+        "interrupted",
+        "Worker PID was reused by a different process before a result was reported.",
+        now,
+      );
+    }
+    // Some platforms do not expose process birth identity portably (and hardened macOS sandboxes
+    // can deny `ps`). Once such a record is both old and inactive, reconcile it without signalling
+    // the possibly unrelated process. A long job that keeps emitting events remains healthy.
+    if (
+      (!job.pidIdentity || !liveIdentity) &&
+      activeAge >= unverifiedPidMaxAgeMs &&
+      silentAge >= inactivityTimeoutMs
+    ) {
+      return persistReconciledJob(
+        root,
+        job,
+        "interrupted",
+        "Worker PID could not be verified and the job exceeded the safe liveness window.",
+        now,
+      );
+    }
+    if (silentAge >= inactivityTimeoutMs) {
+      terminate(job.pid);
+      return persistReconciledJob(
+        root,
+        job,
+        "stalled",
+        `Worker produced no output for ${formatElapsedDuration(silentSince, new Date(now).toISOString())}.`,
+        now,
+      );
+    }
+    return job;
+  });
+}
 
 function currentSessionId(options = {}) {
   return options.env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null;
@@ -80,6 +207,8 @@ const looksLikeVerificationCommand = (line) =>
 export function inferLegacyJobPhase(job, progressPreview = []) {
   if (job.status === "queued") return "queued";
   if (job.status === "cancelled") return "cancelled";
+  if (job.status === "interrupted") return "interrupted";
+  if (job.status === "stalled") return "stalled";
   if (job.status === "failed") return "failed";
   if (job.status === "completed") return "done";
   for (let index = progressPreview.length - 1; index >= 0; index -= 1) {
@@ -108,8 +237,11 @@ export function enrichJob(job, options = {}) {
   const enriched = {
     ...job,
     kindLabel: getJobTypeLabel(job),
-    elapsed: formatElapsedDuration(job.startedAt ?? job.createdAt, active(job) ? null : job.completedAt),
-    duration: active(job)
+    elapsed: formatElapsedDuration(job.startedAt ?? job.createdAt, isActiveJob(job) ? null : job.completedAt),
+    noOutputFor: isActiveJob(job)
+      ? formatElapsedDuration(job.lastEventAt ?? job.startedAt ?? job.createdAt)
+      : null,
+    duration: isActiveJob(job)
       ? null
       : formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt),
     progressPreview,
@@ -138,12 +270,12 @@ export const readStoredJob = (root, id) => {
 };
 export function buildStatusSnapshot(cwd, options = {}) {
   const root = resolveWorkspaceRoot(cwd),
-    jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(root), options)),
-    running = jobs.filter(active).map((job) => enrichJob(job, options)),
-    finished = jobs.filter((job) => !active(job)),
+    jobs = sortJobsNewestFirst(filterJobsForCurrentSession(reconcileActiveJobs(root, options), options)),
+    running = jobs.filter(isActiveJob).map((job) => enrichJob(job, options)),
+    finished = jobs.filter((job) => !isActiveJob(job)),
     latestFinished = finished[0] ? enrichJob(finished[0], options) : null,
     recent = (options.all ? jobs : jobs.slice(0, options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS))
-      .filter((job) => !active(job) && job.id !== latestFinished?.id)
+      .filter((job) => !isActiveJob(job) && job.id !== latestFinished?.id)
       .map((job) => enrichJob(job, options));
   return {
     workspaceRoot: root,
@@ -157,14 +289,15 @@ export function buildStatusSnapshot(cwd, options = {}) {
 }
 export function buildSingleJobSnapshot(cwd, ref, options = {}) {
   const root = resolveWorkspaceRoot(cwd),
-    job = matchJobReference(sortJobsNewestFirst(listJobs(root)), ref);
+    job = matchJobReference(sortJobsNewestFirst(reconcileActiveJobs(root, options)), ref);
   if (!job) throw new Error(`No job found for "${ref}". Run /antigravity:status to inspect known jobs.`);
   return { workspaceRoot: root, job: enrichJob(job, options) };
 }
 export function resolveResultJob(cwd, ref) {
   const root = resolveWorkspaceRoot(cwd),
-    jobs = sortJobsNewestFirst(ref ? listJobs(root) : filterJobsForCurrentSession(listJobs(root))),
-    job = matchJobReference(jobs, ref, (job) => !active(job));
+    reconciled = reconcileActiveJobs(root),
+    jobs = sortJobsNewestFirst(ref ? reconciled : filterJobsForCurrentSession(reconciled)),
+    job = matchJobReference(jobs, ref, (job) => !isActiveJob(job));
   if (job) return { workspaceRoot: root, job };
   const existing = matchJobReference(jobs, ref);
   if (existing) throw new Error(`Job ${existing.id} is still ${existing.status}.`);
@@ -176,7 +309,7 @@ export function resolveResultJob(cwd, ref) {
 }
 export function resolveCancelableJob(cwd, ref, options = {}) {
   const root = resolveWorkspaceRoot(cwd),
-    jobs = sortJobsNewestFirst(listJobs(root)).filter(active);
+    jobs = sortJobsNewestFirst(reconcileActiveJobs(root, options)).filter(isActiveJob);
   if (ref) {
     const job = matchJobReference(jobs, ref);
     if (!job) throw new Error(`No active job found for "${ref}".`);

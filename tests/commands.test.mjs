@@ -64,7 +64,12 @@ test("rescue and deterministic commands document their routing and output contra
   assert.match(rescue, /task-resume-candidate --json/);
   assert.match(rescue, /AskUserQuestion/);
   assert.match(rescue, /stdout verbatim/);
+  assert.match(rescue, /separate quota pools/);
+  assert.match(rescue, /--model gemini-3\.1-pro-high/);
+  assert.match(rescue, /--model claude-sonnet-4-6/);
+  assert.match(rescue, /user's explicit model instruction always wins/i);
   assert.match(readCommand("status"), /\[--wait\].*\[--timeout-ms <ms>\]/);
   assert.match(readCommand("result"), /without summarizing or condensing/);
   assert.match(readCommand("transfer"), /context replay, not a native session import/);
+  assert.doesNotMatch(readCommand("setup"), /disable-model-invocation:\s*true/);
 });
