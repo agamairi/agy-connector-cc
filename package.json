@@ -1,17 +1,28 @@
 {
   "name": "agy-connector-cc",
-  "version": "1.1.0",
-  "private": true,
+  "version": "2.0.0",
   "type": "module",
-  "description": "Use Antigravity from Claude Code for delegation and code review.",
+  "description": "MCP server wrapping Antigravity's Claude Code plugin engine libraries for reliable delegation and review.",
+  "main": "server.mjs",
+  "bin": {
+    "agy-connector-cc": "server.mjs"
+  },
   "license": "MIT",
   "author": "agamairi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agamairi/agy-connector-cc.git"
+  },
   "engines": {
     "node": ">=18.18.0"
   },
   "scripts": {
+    "start": "node server.mjs",
     "test": "node --test tests/*.test.mjs",
     "bump-version": "node scripts/bump-version.mjs",
     "check-version": "node scripts/bump-version.mjs --check"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
   }
 }
