@@ -439,6 +439,24 @@ test("realistic tool events drive progress, touched files, and captured usage", 
   assert.equal(result.usage.thinking_tokens, 425);
 });
 
+test("collects AbsolutePath from agy's write-tool events", () => {
+  const cwd = makeTempDir();
+  const touched = collectTouchedFiles(
+    [
+      {
+        event: "step_update",
+        step_update: toolUpdate(
+          "write_to_file",
+          { AbsolutePath: path.join(cwd, "src", "absolute.js") },
+          "DONE",
+        ),
+      },
+    ],
+    cwd,
+  );
+  assert.deepEqual(touched, [path.join("src", "absolute.js")]);
+});
+
 test("usage tolerates absent and partial result objects", async () => {
   const runScenario = (scenario) =>
     runAgy(makeTempDir(), {

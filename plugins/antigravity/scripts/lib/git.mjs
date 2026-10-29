@@ -114,6 +114,54 @@ export function getWorkingTreeState(cwd) {
   };
 }
 
+function dirtyPaths(state) {
+  return listUniqueFiles(state.staged, state.unstaged, state.untracked);
+}
+
+function workingTreeFingerprint(cwd, relativePath) {
+  const absolutePath = path.resolve(cwd, relativePath);
+  const relative = path.relative(cwd, absolutePath);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Git returned a path outside the working tree: ${relativePath}`);
+  }
+  try {
+    const stat = fs.lstatSync(absolutePath);
+    const kind = stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other";
+    return `${kind}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+// A path can be dirty at both snapshots, so status alone cannot tell whether agy changed it.
+// Record a lightweight filesystem fingerprint while collecting each git snapshot to catch that case.
+export function snapshotWorkingTree(cwd) {
+  const state = getWorkingTreeState(cwd);
+  return new Map(dirtyPaths(state).map((relativePath) => [relativePath, workingTreeFingerprint(cwd, relativePath)]));
+}
+
+export function changedWorkingTreePaths(before, after) {
+  const paths = new Set([...before.keys(), ...after.keys()]);
+  return [...paths].filter((relativePath) => before.get(relativePath) !== after.get(relativePath));
+}
+
+export function normalizePathsToWorkspace(workspaceRoot, paths) {
+  const root = path.resolve(workspaceRoot);
+  const normalized = new Set();
+  for (const value of paths ?? []) {
+    if (typeof value !== "string" || !value.trim()) continue;
+    const absolutePath = path.resolve(root, value);
+    const relative = path.relative(root, absolutePath);
+    normalized.add(
+      relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
+        ? relative || "."
+        : absolutePath,
+    );
+  }
+  return [...normalized];
+}
+
 export function resolveReviewTarget(cwd, options = {}) {
   ensureGitRepository(cwd);
   const requestedScope = options.scope ?? "auto";

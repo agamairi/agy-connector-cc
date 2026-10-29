@@ -335,7 +335,7 @@ function collectTargetPaths(value, paths = []) {
     return paths;
   }
   for (const [key, item] of Object.entries(value)) {
-    if (["TargetFile", "FilePath", "NotebookPath", "Path"].includes(key) && typeof item === "string") {
+    if (["TargetFile", "AbsolutePath", "FilePath", "NotebookPath", "Path"].includes(key) && typeof item === "string") {
       if (item.trim()) paths.push(item.trim());
     } else if (item && typeof item === "object") {
       collectTargetPaths(item, paths);

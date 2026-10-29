@@ -17,7 +17,14 @@ import {
 } from "./lib/agy.mjs";
 import { renderTranscriptAsPrompt, resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import {
+  changedWorkingTreePaths,
+  collectReviewContext,
+  ensureGitRepository,
+  normalizePathsToWorkspace,
+  resolveReviewTarget,
+  snapshotWorkingTree,
+} from "./lib/git.mjs";
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
@@ -356,6 +363,14 @@ async function executeTask(request) {
     throw new Error("No previous Antigravity task conversation was found for this repository.");
   if (!request.prompt && !conversationId)
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume/--resume-last.");
+  let before = null;
+  if (request.write) {
+    try {
+      before = snapshotWorkingTree(root);
+    } catch {
+      // Shell-based edits are only observable from git when a working-tree snapshot is available.
+    }
+  }
   const agy = await runAgy(root, {
     prompt: buildTaskPrompt(request.prompt || "Continue the prior task.", {
       write: request.write,
@@ -368,12 +383,25 @@ async function executeTask(request) {
     readOnly: !request.write,
     onProgress: request.onProgress,
   });
+  let after = null;
+  if (request.write) {
+    try {
+      after = snapshotWorkingTree(root);
+    } catch {
+      // Keep agy's editor-tool paths if git is unavailable or this is not a repository.
+    }
+  }
+  const filesChangedVerified = Boolean(before && after);
+  const gitTouchedFiles = filesChangedVerified ? changedWorkingTreePaths(before, after) : [];
+  const touchedFiles = normalizePathsToWorkspace(root, [...agy.touchedFiles, ...gitTouchedFiles]);
   const verification = request.write ? extractVerificationText(agy.response) : null;
   const payload = {
     status: agy.status,
     conversationId: agy.conversationId,
     model: agy.model,
     verification,
+    touchedFiles,
+    filesChangedVerified,
     rawOutput: agy.response,
     agy,
   };
@@ -382,7 +410,8 @@ async function executeTask(request) {
     stalled: agy.stalled,
     error: agy.error,
     conversationId: agy.conversationId,
-    touchedFiles: agy.touchedFiles,
+    touchedFiles,
+    filesChangedVerified,
     usage: agy.usage,
     model: agy.model,
     verification,

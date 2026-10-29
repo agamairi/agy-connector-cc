@@ -28,9 +28,12 @@ import {
   resolveClaudeSessionPath,
 } from "./plugins/antigravity/scripts/lib/claude-session-transfer.mjs";
 import {
+  changedWorkingTreePaths,
   collectReviewContext,
   ensureGitRepository,
+  normalizePathsToWorkspace,
   resolveReviewTarget,
+  snapshotWorkingTree,
 } from "./plugins/antigravity/scripts/lib/git.mjs";
 import {
   buildSingleJobSnapshot,
@@ -250,6 +253,14 @@ async function executeReview(cwd, request) {
 
 async function executeTask(cwd, request) {
   const root = resolveWorkspaceRoot(cwd);
+  let before = null;
+  if (request.write) {
+    try {
+      before = snapshotWorkingTree(root);
+    } catch {
+      // Shell-based edits are only observable from git when a working-tree snapshot is available.
+    }
+  }
   const agy = await runAgyForJob(request.job, root, {
     prompt: buildTaskPrompt(
       request.prompt || "Continue the prior task.",
@@ -261,6 +272,17 @@ async function executeTask(cwd, request) {
     readOnly: !request.write,
     onProgress: request.onProgress,
   });
+  let after = null;
+  if (request.write) {
+    try {
+      after = snapshotWorkingTree(root);
+    } catch {
+      // Keep agy's editor-tool paths if git is unavailable or this is not a repository.
+    }
+  }
+  const filesChangedVerified = Boolean(before && after);
+  const gitTouchedFiles = filesChangedVerified ? changedWorkingTreePaths(before, after) : [];
+  const touchedFiles = normalizePathsToWorkspace(root, [...agy.touchedFiles, ...gitTouchedFiles]);
   const verification = request.write
     ? extractVerificationText(agy.response)
     : null;
@@ -269,6 +291,8 @@ async function executeTask(cwd, request) {
     conversationId: agy.conversationId,
     model: agy.model,
     verification,
+    touchedFiles,
+    filesChangedVerified,
     rawOutput: agy.response,
     agy,
   };
@@ -277,7 +301,8 @@ async function executeTask(cwd, request) {
     stalled: agy.stalled,
     error: agy.error,
     conversationId: agy.conversationId,
-    touchedFiles: agy.touchedFiles,
+    touchedFiles,
+    filesChangedVerified,
     usage: agy.usage,
     model: agy.model,
     verification,
@@ -825,6 +850,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         conversationId,
         continuation_command: conversationId ? `agy --conversation ${conversationId}` : null,
         touchedFiles: storedJob?.touchedFiles ?? job.touchedFiles ?? [],
+        filesChangedVerified: storedJob?.filesChangedVerified ?? job.filesChangedVerified ?? false,
         usage: storedJob?.usage ?? job.usage ?? null,
         verification: storedJob?.verification ?? job.verification ?? null,
         summary: job.summary ?? null,
@@ -862,6 +888,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         continuation_command: conversationId ? `agy --conversation ${conversationId}` : null,
         touchedFiles:
           storedJob?.touchedFiles ?? snapshot.job.touchedFiles ?? [],
+        filesChangedVerified:
+          storedJob?.filesChangedVerified ?? snapshot.job.filesChangedVerified ?? false,
         usage: storedJob?.usage ?? snapshot.job.usage ?? null,
         verification:
           storedJob?.verification ?? snapshot.job.verification ?? null,

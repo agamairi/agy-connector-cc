@@ -76,7 +76,20 @@ test("stored results render touched files and compact token usage", () => {
   assert.match(rendered, /Tokens: 24,670 total tokens \(425 thinking\)/);
 });
 
-test("read-only results and single-job status explicitly report no modified files", () => {
+test("renders the verified-empty and unverified Files changed states", () => {
+  const verified = renderStoredJobResult(
+    { id: "task-verified", status: "completed", write: true },
+    { rendered: "clean", touchedFiles: [], filesChangedVerified: true },
+  );
+  assert.match(verified, /Files changed: no files modified/);
+
+  // A write job whose git snapshot failed is the only genuinely unknown case.
+  const unverified = renderStoredJobResult(
+    { id: "task-unverified", status: "completed", write: true },
+    { rendered: "clean", touchedFiles: [], filesChangedVerified: false },
+  );
+  assert.match(unverified, /Files changed: not detected \(agy may have edited via shell commands\)/);
+
   const job = {
     id: "review-1",
     status: "completed",
@@ -85,9 +98,11 @@ test("read-only results and single-job status explicitly report no modified file
     touchedFiles: [],
     usage: { total_tokens: 10, thinking_tokens: 0 },
   };
+  // Read-only jobs are write-barriered, so they must not hint at unseen shell edits.
   assert.match(renderStoredJobResult(job, { rendered: "clean", ...job }), /Files changed: no files modified/);
   const status = renderJobStatusReport(job);
   assert.match(status, /Files changed: no files modified/);
+  assert.doesNotMatch(status, /not detected/);
   assert.match(status, /Tokens: 10 total tokens/);
   assert.doesNotMatch(status, /thinking/);
 });

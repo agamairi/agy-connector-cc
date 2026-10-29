@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+
 const args = process.argv.slice(2);
 const scenario = process.env.FAKE_AGY_SCENARIO ?? "success";
 
@@ -158,6 +161,27 @@ if (scenario === "tool-events") {
         step_type: "tool",
         tool_name: "unknown_tool",
         tool_info: { name: "unknown_tool", parameters: {} },
+      },
+    }),
+  );
+}
+if (scenario === "shell-write") {
+  // This mirrors agy's run_command path: the filesystem changes have no editor-tool metadata.
+  fs.writeFileSync(path.join(process.cwd(), "app.js"), "export const value = 'written by shell';\n");
+  fs.writeFileSync(path.join(process.cwd(), "note-b.txt"), "SHELL_TOOL_TEST\n");
+  console.log(
+    JSON.stringify({
+      event: "step_update",
+      step_update: {
+        conversation_id: id,
+        step_index: 3,
+        state: "DONE",
+        step_type: "tool",
+        tool_name: "run_command",
+        tool_info: {
+          name: "run_command",
+          parameters: { CommandLine: "sed -i … app.js && printf … > note-b.txt" },
+        },
       },
     }),
   );

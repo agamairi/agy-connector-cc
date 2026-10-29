@@ -95,7 +95,15 @@ function pushExecutionDetails(lines, job) {
   if (job.model) lines.push(`  Model used: ${job.model}`);
   const touchedFiles = Array.isArray(job.touchedFiles) ? job.touchedFiles : [];
   if (Array.isArray(job.touchedFiles) || job.write === false) {
-    lines.push(`  Files changed: ${touchedFiles.length ? touchedFiles.join(", ") : "no files modified"}`);
+    // Read-only jobs run behind `--mode plan --sandbox`, so an empty list there is a real
+    // "nothing changed", not a gap. Only a write job whose git snapshot failed is genuinely
+    // unknown — saying otherwise would imply a sandboxed job might have edited the tree.
+    const filesChanged = touchedFiles.length
+      ? touchedFiles.join(", ")
+      : job.filesChangedVerified === true || job.write === false
+        ? "no files modified"
+        : "not detected (agy may have edited via shell commands)";
+    lines.push(`  Files changed: ${filesChanged}`);
   }
   const usage = formatUsage(job.usage);
   if (usage) lines.push(`  Tokens: ${usage}`);

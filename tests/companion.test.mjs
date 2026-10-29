@@ -757,6 +757,48 @@ test("write-capable tool events persist user files but exclude agy brain artifac
   assert.doesNotMatch(rendered.stdout, /antigravity-cli\/brain/);
 });
 
+test("git detects shell-only writes, including a file already dirty before the task", () => {
+  const cwd = makeRepository();
+  const pluginData = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeAgy(binDir);
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'dirty before task';\n");
+
+  parseJsonResult(
+    runCompanion(["task", "--write", "--json", "edit", "through", "the", "shell"], {
+      cwd,
+      pluginData,
+      binDir,
+      env: { FAKE_AGY_SCENARIO: "shell-write" },
+    }),
+  );
+  const result = parseJsonResult(runCompanion(["result", "--json"], { cwd, pluginData, binDir }));
+  assert.deepEqual(result.storedJob.touchedFiles, ["app.js", "note-b.txt"]);
+  assert.equal(result.storedJob.filesChangedVerified, true);
+  const rendered = runCompanion(["result", result.job.id], { cwd, pluginData, binDir });
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /Files changed: app\.js, note-b\.txt/);
+});
+
+test("research jobs do not attribute pre-existing working-tree changes to agy", () => {
+  const cwd = makeRepository();
+  const pluginData = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeAgy(binDir);
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'unrelated local edit';\n");
+
+  parseJsonResult(
+    runCompanion(["task", "--json", "research", "only"], { cwd, pluginData, binDir }),
+  );
+  const result = parseJsonResult(runCompanion(["result", "--json"], { cwd, pluginData, binDir }));
+  assert.deepEqual(result.storedJob.touchedFiles, []);
+  assert.equal(result.storedJob.filesChangedVerified, false);
+  const rendered = runCompanion(["result", result.job.id], { cwd, pluginData, binDir });
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /Files changed: no files modified/);
+  assert.doesNotMatch(rendered.stdout, /not detected/);
+});
+
 test("single-job status shows the latest running progress without final-output blocks", () => {
   const cwd = makeRepository();
   const pluginData = makeTempDir();
